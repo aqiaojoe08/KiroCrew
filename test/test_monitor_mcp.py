@@ -140,6 +140,7 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                     "kind": "github_pull_request",
                     "created_ts": 123.0,
                     "wake_count": 3,
+                    "token_usage_known": False,
                     "wake_instructions": "large prompt omitted from inspect",
                     "last_wake_reason_code": "checks_failed",
                     "user_stop_reason": "operator stopped",
@@ -163,6 +164,7 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     assert payload["monitor"]["wake_count"] == 3
     assert payload["monitor"]["last_wake_reason_code"] == "checks_failed"
     assert payload["monitor"]["user_stop_reason"] == "operator stopped"
+    assert payload["monitor"]["token_usage_known"] is False
     assert payload["monitor"]["last_observation_status"] == "pending"
     assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
     assert "last_observation_summary" not in payload["monitor"]

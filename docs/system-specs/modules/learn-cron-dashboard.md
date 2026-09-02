@@ -1612,6 +1612,21 @@ it the model receives a reason and no sanctioned path, which is what produced th
 reported failure mode — an agent that retries the same shape under a different
 reader and then reports the capability missing.
 
+The class is resolved by TIER. A refusal from the built-in rule tier names its
+rule on the first line, so the class comes from that rule's identity
+(`_RULE_CLASSES`, then its category via `_CATEGORY_CLASSES`); every other tier
+carries no rule identity — the un-weakenable fnmatch overlay, the sensitive-path
+floor and the argv-structural note all refuse generically — so for those the class
+is recovered from anchor phrases in the refusal text. Anchors are consulted
+between the two, which is what keeps a category default from flattening an answer
+the text already makes specific. Reading the class out of a rule's REGEX SOURCE
+was the earlier behaviour and it mis-keyed ten `credential-exfil` rules: their
+patterns name the AWS credential environment variables, so the rules that block
+moving credentials OUT were answered with credential-READ prose inviting the
+caller to run the command it wanted. A census in `test_deny_guidance.py` fails
+when a rule in a remediation category resolves to no guidance, so a rule added
+later cannot ship silently unremediated.
+
 That guidance is rendered as **indented prose, never as `- ` bullets**. The
 frontend's `RecoveryCard` counts every bullet in this body as one blocked tool
 call (`BULLET_RE`), so a guidance paragraph written as a list makes one refusal

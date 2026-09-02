@@ -30,16 +30,49 @@ _TARGET = "https://github.com/acme/widgets/pull/7"
 _BABYSIT_SKILL = (
     Path(__file__).parents[1] / "src/kiro_crew/builtin_skills/kirocrew-dev/babysit/SKILL.md"
 )
+_SYSTEM_PROMPT = Path(__file__).parents[1] / "src/kiro_crew/config/prompt.md"
+
+
+def test_babysit_is_reachable_and_the_system_prompt_prefers_structured_watch() -> None:
+    skill = _BABYSIT_SKILL.read_text(encoding="utf-8")
+    prompt = _SYSTEM_PROMPT.read_text(encoding="utf-8")
+
+    assert "triggers: babysit" in skill
+    assert "monitor_watch" in prompt
+    assert "Use `monitor_start`" in prompt
+    assert "only for unsupported targets" in prompt
+    assert "HEARTBEAT.md" not in prompt
 
 
 def test_babysit_keeps_finite_legacy_path_for_unobserved_review_evidence() -> None:
     skill = _BABYSIT_SKILL.read_text(encoding="utf-8")
+    audit = MagicMock()
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_SESSION_KEY),
+        patch("kiro_crew.mcp_core.sel", return_value=audit),
+    ):
+        structured = control.monitor_watch(
+            "monitor_watch",
+            {
+                "kind": "github_pull_request",
+                "target": _TARGET,
+                "objective": "review_ready",
+                "evidence_scope": "provider_facts_and_comments",
+            },
+        )
+        legacy = control.monitor_start(
+            "monitor_start",
+            {"message": "Inspect new review comments and stop when clean."},
+        )
 
-    assert "generic issue or pull-request comments" in skill
-    assert "advisory review findings" in skill
-    assert "required evidence is outside the structured provider" in skill
-    assert '"max_cycles": 24' in skill
-    assert '"max_runtime_secs": 14400' in skill
+    assert structured.startswith("Error:")
+    assert session_directive.decode(structured, "monitor_watch") is None
+    legacy_args = session_directive.decode(legacy, "monitor_start")
+    assert legacy_args is not None
+    assert legacy_args["max_cycles"] == 24
+    assert legacy_args["max_runtime_secs"] == 14_400
+    assert "provider_facts_and_comments" in skill
+    audit.log_tool_invocation.assert_called_once()
 
 
 def test_babysit_keeps_finite_legacy_path_when_terminal_success_must_report() -> None:

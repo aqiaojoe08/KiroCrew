@@ -2,6 +2,7 @@
 name: babysit
 description: Use when a user asks to babysit, monitor, keep checking, keep an eye on, or report when a pull request, CI run, ticket, deployment, or other changing target reaches an outcome.
 inject_on_trigger: false
+triggers: babysit, keep checking, keep an eye on, let me know when, monitor pull request, monitor pr, watch pull request, watch pr
 tags: [skill, kirocrew, monitor, babysit]
 ---
 
@@ -29,6 +30,7 @@ monitor_watch({
   "kind": "github_pull_request",
   "target": "https://github.com/OWNER/REPO/pull/NUMBER",
   "objective": "review_ready",
+  "evidence_scope": "provider_facts",
   "interval_secs": 300,
   "max_runtime_secs": 14400,
   "max_agent_turns": 8,
@@ -65,8 +67,9 @@ retained outcome is `user_stop`. `autonudge_stop` remains a compatibility alias.
 
 The GitHub provider does not observe generic issue or pull-request comments or
 advisory review findings that are not represented by a review thread or check
-conclusion. If the user's definition of readiness depends on that evidence, use
-the finite legacy path below.
+conclusion. When the user's definition of readiness depends on that evidence,
+pass `"evidence_scope": "provider_facts_and_comments"`; the tool authoritatively
+refuses the structured path and directs the caller to the finite legacy path.
 
 ## Legacy — unsupported or unobserved evidence
 

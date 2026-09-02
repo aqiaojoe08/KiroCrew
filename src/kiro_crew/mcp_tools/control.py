@@ -26,7 +26,10 @@ from urllib.parse import urlparse
 
 from kiro_crew import mcp_core, platform_compat, session_directive
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
-from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
+from kiro_crew.mcp_tools._limits import (
+    _MONITOR_DEFAULT_MAX_CYCLES,
+    _MONITOR_DEFAULT_MAX_RUNTIME_SECS,
+)
 from kiro_crew.monitoring.github_pull_request import parse_github_pull_request_target
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_AGENT_TURNS,
@@ -278,6 +281,14 @@ def schemas() -> list[dict[str, Any]]:
                     "kind": {"type": "string", "enum": ["github_pull_request"]},
                     "target": {"type": "string", "description": "Public GitHub PR URL"},
                     "objective": {"type": "string", "enum": ["review_ready"]},
+                    "evidence_scope": {
+                        "type": "string",
+                        "enum": ["provider_facts", "provider_facts_and_comments"],
+                        "description": (
+                            "Facts required by the objective. Comment-dependent watches are "
+                            "refused and must use a finite monitor_start loop"
+                        ),
+                    },
                     "interval_secs": {
                         "type": "integer",
                         "minimum": MIN_MONITOR_CADENCE_SECS,
@@ -382,20 +393,23 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "max_cycles": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000,
                         "description": (
                             "Safety cap on delivered cycles (default "
-                            f"{_MONITOR_DEFAULT_MAX_CYCLES}). Pass 0 for "
-                            "unlimited only when the user explicitly wants an "
-                            "unbounded loop — an unbounded loop whose exit "
-                            "condition is never recognised runs forever"
+                            f"{_MONITOR_DEFAULT_MAX_CYCLES}). Use a larger finite "
+                            "value for a longer watch"
                         ),
                     },
                     "max_runtime_secs": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 604800,
                         "description": (
                             "Wall-clock budget in seconds, measured from when "
-                            "the loop is armed (0 = unlimited, the default; "
-                            "max 604800 = 7 days). Unlike max_cycles this "
+                            "the loop is armed (default "
+                            f"{_MONITOR_DEFAULT_MAX_RUNTIME_SECS}; max 604800 = 7 days). "
+                            "Unlike max_cycles this "
                             "bounds elapsed TIME, so a loop with slow turns or "
                             "a long interval still stops on schedule. The "
                             "budget gates when turns START and re-checks the "
@@ -442,6 +456,8 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "max_cycles": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000,
                         "description": (
                             "New cap on delivered cycles; raise it when a loop "
                             "is close to its cap but the work is still live. "
@@ -450,10 +466,12 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "max_runtime_secs": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 604800,
                         "description": (
                             "New wall-clock budget in seconds, measured from "
-                            "when the loop was first armed (0 = unlimited, max "
-                            "604800 = 7 days). Omit to leave unchanged"
+                            "when the loop was first armed (max 604800 = 7 days). "
+                            "Omit to leave unchanged"
                         ),
                     },
                     "target": {
@@ -988,25 +1006,20 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # (chat_runner) supplies the binding key and arms the loop.
     if mcp_core._autonudge_binding_key(sk) is None and sk:
         return (
-            "monitor_start only works from within a dashboard, Slack, or "
-            f"Discord session (current session_key={sk!r}). For other "
+            "monitor_start only works from within a dashboard, Slack, Discord, "
+            f"or Webex session (current session_key={sk!r}). For other "
             "contexts use cron_add or a HEARTBEAT.md task."
         )
     message = args["message"].strip()
     if not message:
         return "monitor_start: message must not be empty."
     interval_secs = int(args.get("interval_secs") or 300)
-    # Default to a BOUNDED cap. An unbounded loop only ever stops when the
-    # model volunteers an autonudge_stop, and observed loop stores show that
-    # is not reliable: real babysit loops ran to 24/24 and 20/20 cycles and
-    # terminated solely because a cap happened to be set. ``max_cycles=0``
-    # (explicit unlimited) is still honoured for callers that mean it.
+    # Default to bounded cycle and runtime caps. A loop without either bound
+    # only ever stops when the model volunteers an autonudge_stop, and observed
+    # loop stores show that is not reliable.
     raw_max = args.get("max_cycles")
     max_cycles = _MONITOR_DEFAULT_MAX_CYCLES if raw_max is None else int(raw_max)
-    # Wall-clock budget: opt-in (0 = unlimited). The cycle-cap default is
-    # the runaway backstop; the runtime budget is for callers that need a
-    # hard TIME bound (e.g. "babysit this for at most 2 hours").
-    max_runtime_secs = int(args.get("max_runtime_secs") or 0)
+    max_runtime_secs = int(args.get("max_runtime_secs") or _MONITOR_DEFAULT_MAX_RUNTIME_SECS)
     return _emit_directive(
         "monitor_start",
         {
@@ -1023,7 +1036,7 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             + (f", wall-clock budget {max_runtime_secs}s" if max_runtime_secs else "")
             + ". End your turn now; once the loop is armed it wakes you on "
             "that interval — but arming happens when this turn's result is "
-            "processed, and only a live dashboard/Slack/Discord session can "
+            "processed, and only a live dashboard/Slack/Discord/Webex session can "
             "host a loop, so do NOT assume it armed. Call autonudge_stop when "
             "the exit condition is met; hitting the cap is a runaway backstop, "
             "not a finish. Use monitor_update if the instruction goes stale."
@@ -1053,6 +1066,13 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
             sk,
             "monitor_watch only works from within a dashboard, Slack, or "
             f"Discord session (current session_key={sk!r}).",
+        )
+    if args.get("evidence_scope") == "provider_facts_and_comments":
+        return _monitor_context_refusal(
+            "monitor_watch",
+            sk,
+            "monitor_watch cannot observe generic comments or advisory review findings. "
+            "Use a finite monitor_start loop for this evidence scope.",
         )
     target = parse_github_pull_request_target(args["target"]).url
     payload = {

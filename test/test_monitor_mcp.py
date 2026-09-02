@@ -27,6 +27,28 @@ def test_monitor_watch_is_stateless_and_canonical():
     assert "loop_id" not in json.dumps(args)
 
 
+def test_monitor_watch_routes_comment_dependent_readiness_to_legacy_loop():
+    audit = MagicMock()
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"),
+        patch("kiro_crew.mcp_core.sel", return_value=audit),
+    ):
+        result = control.monitor_watch(
+            "monitor_watch",
+            {
+                "kind": "github_pull_request",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "objective": "review_ready",
+                "evidence_scope": "provider_facts_and_comments",
+            },
+        )
+
+    assert result.startswith("Error:")
+    assert "monitor_start" in result
+    assert session_directive.decode(result, "monitor_watch") is None
+    assert audit.log_tool_invocation.call_args.kwargs["outcome"] == "denied"
+
+
 def test_monitor_watch_rejects_native_subagent_binding():
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="subagent:child"):
         result = control.monitor_watch(

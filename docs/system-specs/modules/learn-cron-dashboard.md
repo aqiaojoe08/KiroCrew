@@ -1662,6 +1662,9 @@ restart. An accepted in-flight wake persists its finite completion-evidence
 deadline and resumes that deadline after restart; an older claim with no deadline
 is retained, inactive, and blocked. A persisted `BUSY` claim intentionally has no
 completion deadline and resumes its existing `next_due_ts` retry after restart.
+Before a spent BUSY claim becomes terminal, its settlement path also clears any
+late transport-acceptance marker, so an inactive budget record cannot retain an
+accepted turn that no completion timer owns.
 Future versions also fail closed, are persisted inactive, and are never armed;
 their opaque monitor payload remains preserved for a newer gateway. Malformed
 current-version payloads are replaced once with a valid, inactive
@@ -1683,9 +1686,12 @@ assembles its HTTP application.
 provider observes pull-request lifecycle, mergeability, review decision,
 unresolved review threads, and check conclusions. Generic issue/pull-request
 comments and advisory review findings that are not represented by those typed
-facts remain outside its completion predicate; a babysit objective that requires
-them uses a finite legacy loop instead of claiming structured readiness.
-controller persists canonical allowlisted facts, fingerprint, dedicated latest
+facts remain outside its completion predicate; a babysit objective declares that
+scope to `monitor_watch`, which refuses authoritatively and directs the caller to
+a finite legacy loop instead of claiming structured readiness. Legacy monitor MCP
+calls require positive cycle and runtime caps; omitted caps default to 24 cycles
+and 14,400 seconds. The controller persists canonical allowlisted facts,
+fingerprint, dedicated latest
 classification/reason/summary fields, error counters, decision, and next deadline
 before returning. `last_observation` remains the GitHub fact snapshot; it never
 contains the typed fingerprint, status, reason, or summary. A provider error updates
@@ -1694,6 +1700,9 @@ fingerprint. `NO_CHANGE`, `RECORD_ONLY`,
 `RETRY_PROVIDER`, and all terminal decisions dispatch zero agent turns. Retryable
 provider errors use bounded exponential backoff; terminal provider, success,
 blocked, and budget outcomes remain inspectable with stable reason codes.
+The gateway emits one dashboard notification when a structured record first
+reaches success, blocked, budget, or target-unavailable. This reports a terminal
+outcome without waking the owning conversation or spending another agent turn.
 An incomplete persisted or cancelled handoff with no typed delivery marker is
 normalized onto the bounded BUSY retry path; an untyped dispatcher result fails
 closed as unavailable instead of orphaning the durable claim. Transient Slack or
@@ -1719,6 +1728,9 @@ as a terminal blocked outcome instead of an inactive nonterminal state.
 The controller's pre-probe budget stop uses the same replacement-first ordering,
 so a failed terminal write leaves the active record armed and restart-consistent
 instead of resurrecting work the live process considered exhausted.
+The shared direct budget helper records `STOP_BUDGET` and retains a finite
+completion timer when a transport already accepted the current wake; it never
+cancels the only remaining owner of that completion evidence.
 Known actionable GitHub facts (failed checks, requested changes, unresolved
 review threads, and merge blockers) take precedence over simultaneous pending or
 unknown facts. For an actionable classification its deduplication fingerprint

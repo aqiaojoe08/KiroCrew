@@ -73,7 +73,7 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install)
         "message": "check PR #1 until green",
         "idle_secs": 300,
         "max_cycles": 5,
-        "max_runtime_secs": 0,
+        "max_runtime_secs": 14_400,
     }
 
 
@@ -100,12 +100,10 @@ def test_monitor_start_defaults_interval_300_and_bounded_cap(default_install):
     assert "no cycle cap" not in result.lower()
 
 
-def test_monitor_start_explicit_zero_cap_stays_zero(default_install):
-    """An explicit 0 means the caller really wants unlimited — 0 stays 0 and the
-    confirmation says so."""
-    result = _call_tool_inner("monitor_start", {"message": "watch PR", "max_cycles": 0})
-    assert session_directive.decode(result, "monitor_start")["max_cycles"] == 0
-    assert "no cycle cap" in result.lower()
+@pytest.mark.parametrize("field", ["max_cycles", "max_runtime_secs"])
+def test_monitor_start_rejects_unbounded_zero_limits(default_install, field):
+    with pytest.raises(ValidationError):
+        _call_tool_inner("monitor_start", {"message": "watch PR", field: 0})
 
 
 def test_monitor_start_interval_maps_to_idle_secs(default_install):
@@ -161,9 +159,7 @@ def test_monitor_update_runtime_budget_passes_through(default_install):
     """A revised wall-clock budget lands in the patch; untouched fields are
     omitted, not defaulted over."""
     result = _call_tool_inner("monitor_update", {"max_runtime_secs": 3600})
-    assert session_directive.decode(result, "monitor_update")["patch"] == {
-        "max_runtime_secs": 3600
-    }
+    assert session_directive.decode(result, "monitor_update")["patch"] == {"max_runtime_secs": 3600}
 
 
 def test_monitor_update_empty_patch_returns_plain_message_no_directive(default_install):
@@ -229,8 +225,16 @@ def test_autonudge_stop_short_circuits_for_non_nudgeable_session(monkeypatch):
 
 class _FakeLoop:
     def __init__(
-        self, loop_id, *, cycle_count=0, max_cycles=0, active=True, created_ts=0.0,
-        max_runtime_secs=0, stopped_reason="", slot_key="",
+        self,
+        loop_id,
+        *,
+        cycle_count=0,
+        max_cycles=0,
+        active=True,
+        created_ts=0.0,
+        max_runtime_secs=0,
+        stopped_reason="",
+        slot_key="",
     ):
         self.id = loop_id
         self.cycle_count = cycle_count
@@ -382,8 +386,9 @@ def test_applier_monitor_update_refuses_spent_runtime_budget(monkeypatch):
     import time as _time
 
     armed_two_hours_ago = _time.time() - 7200
-    loop = _FakeLoop("loop-8", cycle_count=3, max_cycles=24, active=True,
-                     created_ts=armed_two_hours_ago)
+    loop = _FakeLoop(
+        "loop-8", cycle_count=3, max_cycles=24, active=True, created_ts=armed_two_hours_ago
+    )
     svc = _FakeSvc(loop)
     _install_svc(monkeypatch, svc)
     update_calls = _record_update(monkeypatch, loop=loop)
@@ -422,7 +427,11 @@ def test_applier_monitor_update_refuses_to_resume_a_paused_loop(monkeypatch):
     update_calls = _record_update(monkeypatch)
     result = asyncio.run(
         apply_session_directive(
-            _fake_state(), _fake_slot(), _SESSION, "monitor_update", {"patch": {"message": "revised"}}
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"message": "revised"}},
         )
     )
     assert "PAUSED" in result
@@ -455,8 +464,12 @@ def test_applier_monitor_update_revives_a_budget_stopped_loop_on_budget_raise(mo
     import time as _time
 
     loop = _FakeLoop(
-        "loop-budget", cycle_count=5, max_cycles=24, active=False,
-        created_ts=_time.time() - 7200, max_runtime_secs=3600,
+        "loop-budget",
+        cycle_count=5,
+        max_cycles=24,
+        active=False,
+        created_ts=_time.time() - 7200,
+        max_runtime_secs=3600,
         stopped_reason="runtime_budget",
     )
     svc = _FakeSvc(loop)
@@ -485,8 +498,12 @@ def test_applier_manual_pause_is_never_revived_by_a_budget_raise(monkeypatch):
     import time as _time
 
     loop = _FakeLoop(
-        "loop-paused-budget", cycle_count=5, max_cycles=24, active=False,
-        created_ts=_time.time() - 7200, max_runtime_secs=3600,
+        "loop-paused-budget",
+        cycle_count=5,
+        max_cycles=24,
+        active=False,
+        created_ts=_time.time() - 7200,
+        max_runtime_secs=3600,
         stopped_reason="manual",
     )
     svc = _FakeSvc(loop)
@@ -513,7 +530,10 @@ def test_applier_approval_stalled_denial_names_the_authorization(monkeypatch):
     ask a human who already answered by letting the grant lapse.
     """
     loop = _FakeLoop(
-        "loop-stalled", cycle_count=3, max_cycles=24, active=False,
+        "loop-stalled",
+        cycle_count=3,
+        max_cycles=24,
+        active=False,
         stopped_reason=APPROVAL_STALL_REASON,
     )
     svc = _FakeSvc(loop)
@@ -540,8 +560,12 @@ def test_applier_monitor_update_budget_stopped_denial_names_the_budget(monkeypat
     import time as _time
 
     loop = _FakeLoop(
-        "loop-budget2", cycle_count=5, max_cycles=24, active=False,
-        created_ts=_time.time() - 7200, max_runtime_secs=3600,
+        "loop-budget2",
+        cycle_count=5,
+        max_cycles=24,
+        active=False,
+        created_ts=_time.time() - 7200,
+        max_runtime_secs=3600,
         stopped_reason="runtime_budget",
     )
     svc = _FakeSvc(loop)
@@ -549,7 +573,10 @@ def test_applier_monitor_update_budget_stopped_denial_names_the_budget(monkeypat
     update_calls = _record_update(monkeypatch)
     result = asyncio.run(
         apply_session_directive(
-            _fake_state(), _fake_slot(), _SESSION, "monitor_update",
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
             {"patch": {"message": "revised"}},
         )
     )
@@ -587,9 +614,7 @@ def test_applier_autonudge_stop_records_tombstone_for_loop_resolved_by_binding(m
         )
     )
     assert svc.get_by_slot_keys == [binding_key_for(_RESEARCH_SESSION)]
-    assert svc.updated == [
-        ("loop-1", {"active": False, "stopped_reason": AUTONUDGE_STOP_REASON})
-    ]
+    assert svc.updated == [("loop-1", {"active": False, "stopped_reason": AUTONUDGE_STOP_REASON})]
     assert svc.removed == []
     assert "stopped" in result.lower()
     assert "done" in result

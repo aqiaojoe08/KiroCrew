@@ -10,11 +10,14 @@ than the one the app's dependencies were installed against — the process then
 starts under the wrong interpreter and dies on import, with nothing surfaced
 to the user.
 
-The policy: prefer the app's OWN venv interpreter (that is where the app's
-``requirements.txt`` was installed, so it is the only interpreter guaranteed
-to carry the app's dependencies), else fall back to the gateway's own
-``sys.executable`` (always an absolute path to a real interpreter). Keeping
-the policy in one place is the point — two divergent copies is exactly the
+The policy: prefer the app's OWN venv interpreter when the app ships one (a
+venv is the strongest signal of which interpreter the app's code expects),
+else fall back to the gateway's own ``sys.executable`` (always an absolute
+path to a real interpreter). The gateway itself does not create app venvs:
+an app's ``requirements.txt`` is provisioned with ``pip install --target``
+into :func:`app_deps_dir` and reaches the child via ``PYTHONPATH`` — which
+every interpreter this policy can resolve honors, venv or not. Keeping the
+policy in one place is the point — two divergent copies is exactly the
 defect class this module removes.
 """
 
@@ -38,6 +41,21 @@ def venv_python_path(root: Path) -> Path:
     return root / ".venv" / "bin" / "python3"
 
 
+def app_deps_dir(root: Path) -> Path:
+    """Directory an app's ``requirements.txt`` is provisioned into.
+
+    Populated by ``pip install --target`` (``backend.py``'s spawn path) and
+    exposed to processes spawned on the app's behalf via ``PYTHONPATH``. A
+    plain directory rather than a venv, because venv creation needs
+    ``ensurepip`` — which the packaged install's bundled interpreter does not
+    ship — and the half-created skeleton a failed attempt leaves behind is
+    runnable enough that :func:`resolve_app_python` would prefer it while it
+    holds no dependencies at all. A ``--target`` install has no bootstrap
+    step, so it cannot leave that trap.
+    """
+    return root / ".kirocrew-deps"
+
+
 def _runnable(path: Path) -> bool:
     """Executable AND non-empty — the resolution-safety predicate.
 
@@ -54,43 +72,84 @@ def _runnable(path: Path) -> bool:
         return False
 
 
+def _venv_version_matches(root: Path) -> bool:
+    """Whether ``root``'s venv was created by the same Python minor version.
+
+    Read from ``pyvenv.cfg`` (``version = X.Y.Z`` from the stdlib, or
+    ``version_info = X.Y.Z...`` from virtualenv/uv). The deps the gateway
+    provisions are built by ``sys.executable`` and reach the child via
+    ``PYTHONPATH``, which sorts BEFORE a venv's ``site-packages`` — so running
+    under a venv of a different minor version would import cp-tagged wheels of
+    the wrong ABI and die on the first native extension. A venv the gateway
+    cannot version-match buys nothing over ``sys.executable`` and carries that
+    risk, so it is not preferred. Missing or unparsable ``pyvenv.cfg`` counts
+    as a mismatch: a bare interpreter file without one is not a working venv.
+    """
+    cfg = root / ".venv" / "pyvenv.cfg"
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key.strip().lower() not in ("version", "version_info"):
+            continue
+        parts = value.strip().split(".")
+        try:
+            return (int(parts[0]), int(parts[1])) == sys.version_info[:2]
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
 def resolve_app_python(root: Path | None) -> str:
     """Absolute interpreter for processes spawned on an app's behalf.
 
     Prefers ``<root>/.venv``'s interpreter when it exists as a runnable,
-    non-empty executable (the app's own dependencies live there), else the
-    gateway's ``sys.executable`` — never a bare PATH-resolved name. The
-    runnability check matters: a venv interpreter that lost its execute bit or
-    was truncated to zero bytes (a partial copy, a restore that dropped
-    content) would turn a working ``sys.executable`` fallback into a
-    guaranteed spawn failure. ``root=None`` means "no app context" and
-    resolves straight to ``sys.executable``.
+    non-empty executable AND its ``pyvenv.cfg`` names the same Python minor
+    version as the gateway (see :func:`_venv_version_matches` — provisioned
+    deps arrive via ``PYTHONPATH`` built by ``sys.executable``, so a
+    version-mismatched venv would mix ABIs). Else the gateway's
+    ``sys.executable`` — never a bare PATH-resolved name. The runnability
+    check matters: a venv interpreter that lost its execute bit or was
+    truncated to zero bytes (a partial copy, a restore that dropped content)
+    would turn a working ``sys.executable`` fallback into a guaranteed spawn
+    failure. ``root=None`` means "no app context" and resolves straight to
+    ``sys.executable``.
     """
     if root is not None:
         venv_py = venv_python_path(root)
-        if _runnable(venv_py):
+        if _runnable(venv_py) and _venv_version_matches(root):
             return str(venv_py)
     return sys.executable
 
 
 def venv_provided_command(root: Path, name: str) -> str | None:
-    """Absolute path of ``name`` if the app's venv provides it, else ``None``.
+    """Absolute path of ``name`` if the app's venv or deps dir provides it.
 
-    Covers console scripts a venv install creates (``.venv/bin/<name>`` on
-    POSIX, ``.venv\\Scripts\\<name>.exe`` on Windows — the ``.exe`` suffix is
-    appended only when ``name`` does not already carry it). Only a runnable
-    venv-provided binary is a safe rewrite target: anything else a manifest
-    names bare (``node``, ``docker``) was a deliberate PATH dependency and must
-    be left alone, and a non-executable venv file (a data artifact, a partial
-    pip install) must not displace a command that would otherwise work.
+    Covers console scripts a pip install creates: ``.venv/bin/<name>`` for an
+    app-owned venv, and ``<deps dir>/bin/<name>`` for the gateway's
+    ``pip install --target`` provisioning (``Scripts\\`` on Windows in both
+    layouts; the ``.exe`` suffix is appended only when ``name`` does not
+    already carry it). Both are invisible to PATH — a venv is never activated
+    and a target dir has no activation at all. Only a runnable provided binary
+    is a safe rewrite target: anything else a manifest names bare (``node``,
+    ``docker``) was a deliberate PATH dependency and must be left alone, and a
+    non-executable file (a data artifact, a partial pip install) must not
+    displace a command that would otherwise work.
 
     Callers must pass a bare NAME (no path separators, no drive qualifier) —
     the caller-side guard in ``resolve_stdio_command`` enforces that, keeping
-    the join below inside the venv directory.
+    the joins below inside the probed directories.
     """
     if platform_compat.IS_WINDOWS:
+        scripts = "Scripts"
         exe_name = name if name.lower().endswith(".exe") else f"{name}.exe"
-        candidate = root / ".venv" / "Scripts" / exe_name
     else:
-        candidate = root / ".venv" / "bin" / name
-    return str(candidate) if _runnable(candidate) else None
+        scripts = "bin"
+        exe_name = name
+    for base in (root / ".venv" / scripts, app_deps_dir(root) / scripts):
+        candidate = base / exe_name
+        if _runnable(candidate):
+            return str(candidate)
+    return None

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -1265,7 +1266,10 @@ def _fake_venv_python(app_root: Path) -> Path:
 
     Non-empty and executable on purpose: the resolver rejects zero-byte files
     (the Microsoft-Store-stub / interrupted-copy shape) and files without the
-    execute bit.
+    execute bit. A version-matched ``pyvenv.cfg`` is written alongside because
+    the resolver also refuses a venv created by a different Python minor
+    version (provisioned deps arrive via ``PYTHONPATH`` built by
+    ``sys.executable``, so a mismatched venv would mix ABIs).
     """
     if platform_compat.IS_WINDOWS:
         py = app_root / ".venv" / "Scripts" / "python.exe"
@@ -1274,6 +1278,9 @@ def _fake_venv_python(app_root: Path) -> Path:
     py.parent.mkdir(parents=True, exist_ok=True)
     py.write_text("#!/bin/sh\n")
     py.chmod(0o755)
+    (app_root / ".venv" / "pyvenv.cfg").write_text(
+        f"version = {sys.version_info[0]}.{sys.version_info[1]}.0\n"
+    )
     return py
 
 
@@ -1823,6 +1830,51 @@ class TestBackendSharesTheInterpreterPolicy:
         assert '".venv" / "bin" / "python3").is_file()' not in source, (
             "backend.py grew back an inline copy of the interpreter policy"
         )
+
+
+class TestStdioDepsDirExposure:
+    """The provisioned deps dir (pip --target) must reach stdio MCP servers the
+    same way it reaches the backend spawn: via PYTHONPATH. A --target install
+    carries no interpreter, so the env is the only bridge — without it a
+    python-launcher server or a deps-provided console script dies on import."""
+
+    def test_the_deps_dir_is_prepended_to_a_stdio_server_pythonpath(self, tmp_path):
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        app_deps_dir(tmp_path).mkdir(parents=True)
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"], "env": {"PYTHONPATH": "/manifest/own"}},
+            app_root=tmp_path,
+        )
+        parts = cfg["env"]["PYTHONPATH"].split(os.pathsep)
+        assert parts[0] == str(app_deps_dir(tmp_path)), cfg
+        assert "/manifest/own" in parts, cfg
+
+    def test_no_deps_dir_leaves_the_manifest_env_untouched(self, tmp_path):
+        from kiro_crew.apps.bridges import resolve_stdio_command
+
+        cfg = resolve_stdio_command(
+            {"command": "python3", "args": ["server.py"]}, app_root=tmp_path
+        )
+        assert "env" not in cfg, cfg
+
+    def test_a_deps_dir_console_script_is_rewritten_and_gets_the_env(self, tmp_path):
+        from kiro_crew.apps.bridges import resolve_stdio_command
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        scripts = "Scripts" if platform_compat.IS_WINDOWS else "bin"
+        name = "my-mcp-server.exe" if platform_compat.IS_WINDOWS else "my-mcp-server"
+        script = app_deps_dir(tmp_path) / scripts / name
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+        cfg = resolve_stdio_command({"command": "my-mcp-server"}, app_root=tmp_path)
+        assert cfg["command"] == str(script), cfg
+        # The script's shebang is the INSTALLING interpreter (sys.executable),
+        # which sees the script's own package only through this env.
+        parts = cfg["env"]["PYTHONPATH"].split(os.pathsep)
+        assert parts[0] == str(app_deps_dir(tmp_path)), cfg
 
 
 # ---------------------------------------------------------------------------

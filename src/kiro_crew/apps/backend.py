@@ -6,6 +6,7 @@ the backend process lifecycle: spawn on enable, health-check, stop on disable.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import http.client
 import json
 import logging
@@ -30,7 +31,7 @@ from kiro_crew.apps.execution import (
     shipped_builtin_app_root,
     shipped_builtin_module_path,
 )
-from kiro_crew.apps.interpreter import resolve_app_python, venv_python_path
+from kiro_crew.apps.interpreter import app_deps_dir, resolve_app_python
 from kiro_crew.apps.manager import app_dir, get_app_manifest, list_apps
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.atomic_write import atomic_write
@@ -44,6 +45,7 @@ from kiro_crew.sandbox import (
     run_limited,
     wrap_argv,
 )
+from kiro_crew.security import redact_credentials
 from kiro_crew.sel import sel
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -424,6 +426,31 @@ _processes: dict[str, AppProcess] = {}  # app_name -> AppProcess
 # elevated-but-finite NOFILE ceiling as the workload's ANCESTOR. Every other
 # app backend keeps the standard (operator-configurable) resource policy.
 _BUILD_CAPABLE_APPS = frozenset({"dev-fleet"})
+
+# requirements.txt provisioning (pip --target into apps/interpreter.app_deps_dir).
+# The stamp records the digest a successful install came from (requirements
+# bytes + the installing interpreter's ABI tag — see _deps_digest), so a start
+# where neither changed skips pip entirely. Staging/prior are transient swap
+# directories: pip fills staging, success renames it live, and prior briefly
+# holds the outgoing install so a failure at any point leaves either the old
+# tree or the new one — never a half-replaced mix.
+_DEPS_STAMP_NAME = ".requirements-sha256"
+_DEPS_STAGING_NAME = ".kirocrew-deps-staging"
+_DEPS_PRIOR_NAME = ".kirocrew-deps-prior"
+
+
+def _deps_digest(requirements: bytes) -> str:
+    """Stamp digest for a provisioned deps dir.
+
+    Folds the installing interpreter's cache tag (e.g. ``cpython-312``) in
+    with the requirements bytes: wheels installed by ``pip --target`` are
+    ABI-specific, so after a gateway Python upgrade an UNCHANGED
+    requirements.txt must still reprovision — a requirements-only stamp would
+    skip pip and leave old-ABI wheels live.
+    """
+    tag = sys.implementation.cache_tag or ""
+    return hashlib.sha256(tag.encode() + b"\n" + requirements).hexdigest()
+
 
 _lock = threading.Lock()
 
@@ -817,41 +844,125 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         except OSError:
             pass  # port is free — proceed to spawn
 
-    # Install Python dependencies into a per-app venv (isolated from KiroCrew runtime)
+    # Install Python dependencies into a per-app deps dir (isolated from the
+    # Kiro Crew runtime). `pip install --target` rather than a venv: packaged
+    # installs bundle an interpreter that ships pip but no ensurepip, so
+    # `-m venv` dies after creating the directory skeleton — and the venv-first
+    # interpreter policy would then prefer that skeleton while it holds none of
+    # the app's dependencies. A --target install needs no bootstrap and works
+    # identically under packaged and source installs; the deps dir reaches the
+    # child via PYTHONPATH (set where the spawn env is built below).
+    # sys.executable, never a bare "python3": the bare name relies on PATH
+    # (absent on some hosts, a Store stub on Windows) — the same policy every
+    # app spawn path applies via apps/interpreter.
+    #
+    # The install is stamp-gated and staged:
+    # - A hash of requirements.txt is stamped into the deps dir on success, and
+    #   a matching stamp skips pip entirely — so a restart with unchanged
+    #   requirements does no network work and an OFFLINE restart of a healthy
+    #   backend raises no alarm (pip --target cannot answer "already
+    #   satisfied" the way a venv install could).
+    # - pip installs into a staging dir that is swapped in only on success, so
+    #   an interrupted or failed (re)install can never corrupt the live deps
+    #   dir in place — the prior good install keeps serving the spawn below.
     req_file = root / "requirements.txt"
+    provision_error = ""
     if req_file.is_file():
-        venv_dir = root / ".venv"
-        _env = minimal_env()  # don't leak secrets to pip/venv subprocesses
-        try:
-            if not venv_dir.exists():
-                # sys.executable, never a bare "python3": the bare name relies on
-                # PATH (absent on some hosts, a Store stub on Windows) — the same
-                # policy every app spawn path applies via apps/interpreter.
-                venv_cmd, _ = wrap_argv(
-                    [sys.executable, "-m", "venv", str(venv_dir)], mode="standard"
+        deps_dir = app_deps_dir(root)
+        prior = root / _DEPS_PRIOR_NAME
+        # Recover from an interrupted swap: a crash between the two renames
+        # below leaves only the outgoing tree under the prior name. Put it
+        # back before the stamp check, so an offline restart still has its
+        # last good install (and a matching stamp skips pip entirely).
+        if not deps_dir.exists() and prior.exists():
+            try:
+                prior.rename(deps_dir)
+            except OSError as exc:
+                logger.warning(
+                    "App %s: could not recover interrupted deps swap: %s", app_name, exc
                 )
-                venv_cmd = cgroup_scope_argv(venv_cmd)  # cgroup DoS ceiling
+        stamp = deps_dir / _DEPS_STAMP_NAME
+        try:
+            digest = _deps_digest(req_file.read_bytes())
+        except OSError:
+            digest = ""
+        try:
+            provisioned = bool(digest) and stamp.read_text(encoding="utf-8").strip() == digest
+        except OSError:
+            provisioned = False
+        if not provisioned:
+            staging = root / _DEPS_STAGING_NAME
+            _env = minimal_env()  # don't leak secrets to pip subprocesses
+            try:
+                shutil.rmtree(staging, ignore_errors=True)
+                staging.mkdir(parents=True, exist_ok=True)
+                pip_cmd, _ = wrap_argv(
+                    [sys.executable, "-m", "pip", "install", "--quiet",
+                     "--disable-pip-version-check",
+                     "--target", str(staging), "-r", str(req_file)], mode="standard"
+                )
+                pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
+                # check=True: a non-zero pip exit IS a provisioning failure. It
+                # must not be discarded — the backend would spawn without its
+                # dependencies and die on an import error pointing at the app.
                 run_limited(
-                    venv_cmd,
+                    pip_cmd,
                     check=True, capture_output=True, timeout=60, env=_env,
                 )
-            # Invoke pip through the venv's own interpreter: `.venv/bin/pip` is
-            # POSIX-only (Windows venvs ship Scripts\), and `<venv python> -m pip`
-            # is the layout-independent spelling. Without it a Windows venv is
-            # created but never provisioned — and would then be preferred by the
-            # venv-first interpreter policy while holding none of the app's deps.
-            venv_python = str(venv_python_path(root))
-            pip_cmd, _ = wrap_argv(
-                [venv_python, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "-r", str(req_file)], mode="standard"
-            )
-            pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
-            run_limited(
-                pip_cmd,
-                capture_output=True, timeout=60, env=_env,
-            )
-        except Exception as exc:
-            logger.warning("Failed to install deps for app %s: %s", app_name, exc)
+                if digest:
+                    (staging / _DEPS_STAMP_NAME).write_text(digest, encoding="utf-8")
+                # Swap the fresh install live. Two renames, not an in-place
+                # upgrade, so no state mixes old and new trees; the recovery
+                # above (and the restore in the except arm) covers the window
+                # in which only the prior name exists.
+                shutil.rmtree(prior, ignore_errors=True)
+                if deps_dir.exists():
+                    deps_dir.rename(prior)
+                staging.rename(deps_dir)
+                shutil.rmtree(prior, ignore_errors=True)
+            except Exception as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                # If the failure hit between the swap renames (e.g. a locked
+                # directory on Windows), the live name is empty and the good
+                # tree sits under the prior name — put it back.
+                if not deps_dir.exists() and prior.exists():
+                    try:
+                        prior.rename(deps_dir)
+                    except OSError as restore_exc:
+                        logger.warning(
+                            "App %s: could not restore prior deps after failed swap: %s",
+                            app_name, restore_exc,
+                        )
+                detail = str(exc)
+                stderr = getattr(exc, "stderr", None)
+                if stderr:
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode("utf-8", "replace")
+                    detail = f"{detail}: {stderr.strip()[-400:]}"
+                # pip errors can echo an index URL carrying credentials
+                # (`--index-url https://user:token@host/`); this detail reaches
+                # the gateway log and the user-visible backend log.
+                detail, _ = redact_credentials(detail)
+                provision_error = (
+                    f"Failed to install requirements.txt dependencies for app "
+                    f"{app_name}: {detail}"
+                )
+                # The spawn is still attempted: the deps dir may hold a
+                # previous successful install, and some requirements are
+                # optional. The failure is surfaced instead of swallowed: an
+                # error log here, and a header line in the backend's own log so
+                # the import error missing deps produce points back at
+                # provisioning.
+                logger.error("%s", provision_error)
+                try:
+                    sel().log_api_access(
+                        caller="gateway", operation="app_backend_spawn",
+                        outcome="deps_provision_failed", resources=app_name,
+                    )
+                except Exception as sel_exc:
+                    logger.debug(
+                        "SEL audit failed for app %s deps failure: %s", app_name, sel_exc
+                    )
 
     # Spawn process — use manifest backend type if available, fall back to heuristic
     # Pass the gateway's resolved config home explicitly: under pods or any
@@ -975,6 +1086,18 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             env["KIROCREW_PROXY_SECRET"] = _proxy_secret
     except OSError:
         pass
+    # Expose the provisioned deps dir (pip --target, above) to the child.
+    # PYTHONPATH rather than an interpreter switch: it is honored identically
+    # by the app's own venv interpreter and the gateway fallback, on every
+    # platform. Prepended so the app's pinned requirements win over anything
+    # the operator's own PYTHONPATH (passed through by minimal_env) carries.
+    # Gated on the dir existing, so apps without provisioned deps are unchanged.
+    _deps_dir = app_deps_dir(root)
+    if _deps_dir.is_dir():
+        _existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            f"{_deps_dir}{os.pathsep}{_existing_pp}" if _existing_pp else str(_deps_dir)
+        )
     entry_str = str(entry) if entry else entry_point
 
     # Prefer explicit backend type from manifest over content sniffing
@@ -1170,6 +1293,13 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
 
     try:
         log_fh = open(log_path, "w")
+        if provision_error:
+            # Put the real cause at the top of the backend's own (user-visible)
+            # log: the import error missing deps produce reads as an app bug,
+            # and this line points it back at provisioning. Written and flushed
+            # before the spawn, so the child's inherited fd appends after it.
+            log_fh.write(f"[kiro-crew] {provision_error}\n")
+            log_fh.flush()
         # Process-group isolation so stop_app_backend can tree-kill the app. Pass
         # both flags explicitly (NOT via **dict unpack — that breaks mypy's Popen
         # overload resolution on the build fleet): start_new_session=True is a

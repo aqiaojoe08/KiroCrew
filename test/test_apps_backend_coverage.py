@@ -5,7 +5,7 @@ and ``test_app_backend_stale_reap.py`` (pidfile reap safety) by exercising the
 branches those files leave untouched:
 
 * the adopt-an-already-healthy-instance path and its refusals,
-* the per-app venv / pip and npm dependency-install branches,
+* the per-app pip --target / npm dependency-install branches,
 * the Node and ASGI dispatch branches,
 * ``stop_app_backend``'s adopted-PID revalidation and SIGKILL escalation,
 * the pidfile helpers' error paths and ``_proc_start_time``'s two platforms,
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import urllib.error
@@ -858,64 +859,334 @@ class TestAdoptExistingInstance:
 
 
 class TestDependencyInstall:
-    def test_requirements_txt_provisions_a_per_app_venv_then_pip_installs(
+    def test_requirements_txt_provisions_the_deps_dir_without_a_venv(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Provisioning is a single `pip install --target` into a staging dir
+        that is swapped live on success (with the requirements hash stamped).
+
+        Never `-m venv`: a packaged install's bundled interpreter ships pip
+        but no ensurepip, so venv creation dies after building the directory
+        skeleton — which the venv-first interpreter policy then prefers while
+        it holds none of the app's dependencies."""
+        from kiro_crew.apps.interpreter import app_deps_dir
+
         (spawn_root / "server.py").write_text("x = 1\n")
         (spawn_root / "requirements.txt").write_text("requests\n")
         runs = _record_runs(monkeypatch)
         _capture_popen(monkeypatch)
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("deps", _manifest("server.py"))
-        assert any("venv" in argv for argv in runs), runs
+        assert not any("venv" in argv for argv in runs), runs
+        pip_argv = next(argv for argv in runs if "install" in argv)
+        target_idx = pip_argv.index("--target")
+        assert pip_argv[target_idx + 1] == str(spawn_root / bmod._DEPS_STAGING_NAME), pip_argv
+        # Success swapped the staging dir live and stamped the requirements
+        # hash, so the next start with an unchanged file can skip pip.
+        deps_dir = app_deps_dir(spawn_root)
+        assert deps_dir.is_dir()
+        assert not (spawn_root / bmod._DEPS_STAGING_NAME).exists()
+        assert (deps_dir / bmod._DEPS_STAMP_NAME).read_text() == bmod._deps_digest(
+            b"requests\n"
+        )
+
+    def test_an_unchanged_requirements_file_skips_the_pip_call(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pip --target cannot answer "already satisfied" the way a venv
+        install could, so the stamp is what keeps a restart with unchanged
+        requirements off the network — and keeps an OFFLINE restart of a
+        healthy backend from raising a false provisioning alarm."""
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests\n")
+        deps_dir = app_deps_dir(spawn_root)
+        deps_dir.mkdir()
+        (deps_dir / bmod._DEPS_STAMP_NAME).write_text(bmod._deps_digest(b"requests\n"))
+        runs = _record_runs(monkeypatch)
+        _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-skip", _manifest("server.py"))
+        assert not any("install" in argv for argv in runs), runs
+
+    def test_a_changed_requirements_file_reinstalls(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests==2.32.0\n")
+        deps_dir = app_deps_dir(spawn_root)
+        deps_dir.mkdir()
+        (deps_dir / bmod._DEPS_STAMP_NAME).write_text(
+            bmod._deps_digest(b"requests\n")  # stamp of the OLD file
+        )
+        runs = _record_runs(monkeypatch)
+        _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-changed", _manifest("server.py"))
         assert any("install" in argv for argv in runs), runs
+
+    def test_the_stamp_digest_changes_with_the_interpreter_abi(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wheels installed by pip --target are ABI-specific, so a gateway
+        Python upgrade must reprovision even when requirements.txt is
+        byte-identical — a requirements-only stamp would skip pip and leave
+        old-ABI wheels live."""
+        before = bmod._deps_digest(b"requests\n")
+        monkeypatch.setattr(
+            bmod.sys, "implementation",
+            SimpleNamespace(cache_tag="cpython-399"),
+        )
+        assert bmod._deps_digest(b"requests\n") != before
+
+    def test_an_interrupted_swap_is_recovered_on_the_next_start(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A crash between the two swap renames leaves the good tree under the
+        prior name only. The next start must put it back — and, with a
+        matching stamp inside, skip pip — so an offline restart keeps its
+        dependencies instead of spawning bare."""
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests\n")
+        prior = spawn_root / bmod._DEPS_PRIOR_NAME
+        prior.mkdir()
+        (prior / bmod._DEPS_STAMP_NAME).write_text(bmod._deps_digest(b"requests\n"))
+        (prior / "marker.py").write_text("recovered = True\n")
+        runs = _record_runs(monkeypatch)
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-recover", _manifest("server.py"))
+        deps_dir = app_deps_dir(spawn_root)
+        assert (deps_dir / "marker.py").is_file()
+        assert not prior.exists()
+        assert not any("install" in argv for argv in runs), runs
+        assert seen["kwargs"]["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(deps_dir)
+
+    def test_a_failed_reinstall_leaves_the_prior_deps_dir_intact(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pip fills a staging dir that is swapped in only on success, so a
+        failed or interrupted (re)install can never corrupt the live deps dir
+        in place — the prior good install keeps serving the spawn."""
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests==2.32.0\n")
+        deps_dir = app_deps_dir(spawn_root)
+        (deps_dir / "requests").mkdir(parents=True)
+        (deps_dir / "requests" / "__init__.py").write_text("prior = True\n")
+        _record_runs(monkeypatch, exc=RuntimeError("no network"))
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-keep", _manifest("server.py"))
+        assert (deps_dir / "requests" / "__init__.py").read_text() == "prior = True\n"
+        assert not (spawn_root / bmod._DEPS_STAGING_NAME).exists()
+        # And the surviving install still reaches the child.
+        assert seen["kwargs"]["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(deps_dir)
 
     def test_the_installer_never_shells_out_to_a_bare_interpreter(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Venv creation must use sys.executable and pip must run as
-        `<venv python> -m pip` — `.venv/bin/pip` is POSIX-only and a bare
-        `python3` relies on PATH. Anything else leaves a Windows venv created
-        but never provisioned, which the venv-first interpreter policy would
-        then prefer while it holds none of the app's dependencies."""
-        import sys
-
-        from kiro_crew.apps.interpreter import venv_python_path
-
+        """pip must run as `sys.executable -m pip` — a bare `python3` relies
+        on PATH (absent on some hosts, a Store stub on Windows), and any
+        venv-relative pip path is POSIX-only."""
         (spawn_root / "server.py").write_text("x = 1\n")
         (spawn_root / "requirements.txt").write_text("requests\n")
         runs = _record_runs(monkeypatch)
         _capture_popen(monkeypatch)
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("deps-argv", _manifest("server.py"))
-        venv_argv = next(argv for argv in runs if "venv" in argv)
+        pip_argv = next(argv for argv in runs if "install" in argv)
         # Assert on the argv TOKEN, never on a substring of the joined command.
         # sys.executable's own basename is frequently `python3` (any mise- or
         # pyenv-managed interpreter, and /usr/bin/python3 itself), so a
-        # substring check for "python3 -m venv" matches the correct absolute
-        # form and fails on exactly the hosts it is meant to pass on.
-        assert venv_argv[0] == sys.executable, venv_argv
-        assert venv_argv[0] != "python3", venv_argv
-        assert venv_argv[1:3] == ["-m", "venv"], venv_argv
-        pip_argv = next(argv for argv in runs if "install" in argv)
-        assert pip_argv[0] == str(venv_python_path(spawn_root)), pip_argv
+        # substring check matches the correct absolute form and fails on
+        # exactly the hosts it is meant to pass on.
+        assert pip_argv[0] == sys.executable, pip_argv
+        assert pip_argv[0] != "python3", pip_argv
         assert pip_argv[1:3] == ["-m", "pip"], pip_argv
         # `.venv/bin/pip` is POSIX-only; the interpreter must run pip as a module.
         assert not pip_argv[0].replace("\\", "/").endswith("/bin/pip"), pip_argv
 
+    def test_a_nonzero_pip_exit_is_checked_not_discarded(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pip call passes check=True: a non-zero exit must raise into the
+        failure path rather than being silently discarded (the original defect
+        left the backend to die on an import error pointing away from
+        provisioning)."""
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests\n")
+        kwargs_seen: list[dict[str, Any]] = []
+
+        def _run(argv: Any, **kwargs: Any) -> Any:
+            kwargs_seen.append(kwargs)
+            return SimpleNamespace(returncode=0, stdout="")
+
+        monkeypatch.setattr(bmod, "run_limited", _run)
+        _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-check", _manifest("server.py"))
+        assert kwargs_seen and kwargs_seen[0].get("check") is True, kwargs_seen
+
     def test_a_failed_dependency_install_does_not_block_the_spawn(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Deps are best-effort: an offline host must still get its backend tried."""
+        """The spawn is still attempted (the deps dir may hold a previous
+        successful install, and an offline host must not lose a working
+        backend to a failed refresh) — but the failure now surfaces as an
+        ERROR naming provisioning, not a swallowed warning."""
 
         (spawn_root / "server.py").write_text("x = 1\n")
         (spawn_root / "requirements.txt").write_text("requests\n")
         _record_runs(monkeypatch, exc=RuntimeError("no network"))
         _capture_popen(monkeypatch)
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.ERROR):
             with pytest.raises(_StopSpawn):
                 bmod._start_app_backend_body("deps-fail", _manifest("server.py"))
-        assert any("Failed to install deps" in r.message for r in caplog.records)
+        assert any(
+            "Failed to install requirements.txt dependencies" in r.message
+            and r.levelno == logging.ERROR
+            for r in caplog.records
+        )
+
+    def test_a_provisioning_failure_is_written_into_the_backend_log(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The user-visible surface: the backend's own log opens with the
+        provisioning failure, so the import error the missing deps produce
+        points back at the real cause instead of reading as an app bug."""
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests\n")
+        err = subprocess.CalledProcessError(
+            1, ["pip"], stderr=b"No matching distribution found for requests"
+        )
+        _record_runs(monkeypatch, exc=err)
+        _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-log", _manifest("server.py"))
+        log_text = (spawn_root / "data" / "logs" / "backend.log").read_text()
+        assert "Failed to install requirements.txt dependencies" in log_text
+        assert "No matching distribution found" in log_text
+
+    def test_the_provisioned_deps_dir_reaches_the_child_via_pythonpath(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A --target install carries no interpreter, so PYTHONPATH is the
+        only bridge to the child — and the deps dir must come FIRST so the
+        app's pinned requirements win over the operator's own PYTHONPATH."""
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        deps_dir = app_deps_dir(spawn_root)
+        deps_dir.mkdir()
+        (spawn_root / "server.py").write_text("x = 1\n")
+        monkeypatch.setenv("PYTHONPATH", "/operator/own")
+        _record_runs(monkeypatch)
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-env", _manifest("server.py"))
+        child_pp = seen["kwargs"]["env"]["PYTHONPATH"]
+        assert child_pp.split(os.pathsep)[0] == str(deps_dir), child_pp
+        assert "/operator/own" in child_pp.split(os.pathsep), child_pp
+
+    def test_no_deps_dir_means_no_pythonpath_injection(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (spawn_root / "server.py").write_text("x = 1\n")
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+        _record_runs(monkeypatch)
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-none", _manifest("server.py"))
+        assert "PYTHONPATH" not in seen["kwargs"]["env"]
+
+
+# ---------------------------------------------------------------------------
+# Shared interpreter resolution (apps/interpreter.py)
+# ---------------------------------------------------------------------------
+
+
+def _write_runnable(path: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+
+
+class TestInterpreterResolution:
+    def _venv_python(self, root: Any) -> Any:
+        from kiro_crew.apps.interpreter import venv_python_path
+
+        return venv_python_path(root)
+
+    def test_a_version_matched_venv_is_preferred(self, tmp_path: Any) -> None:
+        from kiro_crew.apps.interpreter import resolve_app_python
+
+        py = self._venv_python(tmp_path)
+        _write_runnable(py)
+        (tmp_path / ".venv" / "pyvenv.cfg").write_text(
+            f"version = {sys.version_info[0]}.{sys.version_info[1]}.9\n"
+        )
+        assert resolve_app_python(tmp_path) == str(py)
+
+    def test_a_version_mismatched_venv_falls_back_to_the_gateway_interpreter(
+        self, tmp_path: Any
+    ) -> None:
+        """Provisioned deps are built by sys.executable and PYTHONPATH sorts
+        before a venv's site-packages, so a venv of a different minor version
+        would import cp-tagged wheels of the wrong ABI — it buys nothing over
+        sys.executable and carries that risk."""
+        from kiro_crew.apps.interpreter import resolve_app_python
+
+        _write_runnable(self._venv_python(tmp_path))
+        (tmp_path / ".venv" / "pyvenv.cfg").write_text("version = 2.6.0\n")
+        assert resolve_app_python(tmp_path) == sys.executable
+
+    def test_the_virtualenv_version_info_spelling_is_honored(self, tmp_path: Any) -> None:
+        from kiro_crew.apps.interpreter import resolve_app_python
+
+        py = self._venv_python(tmp_path)
+        _write_runnable(py)
+        (tmp_path / ".venv" / "pyvenv.cfg").write_text(
+            f"version_info = {sys.version_info[0]}.{sys.version_info[1]}.1.final.0\n"
+        )
+        assert resolve_app_python(tmp_path) == str(py)
+
+    def test_a_venv_without_pyvenv_cfg_is_not_preferred(self, tmp_path: Any) -> None:
+        """A bare interpreter file with no pyvenv.cfg is not a working venv —
+        the half-built skeleton shape a failed bootstrap leaves behind."""
+        from kiro_crew.apps.interpreter import resolve_app_python
+
+        _write_runnable(self._venv_python(tmp_path))
+        assert resolve_app_python(tmp_path) == sys.executable
+
+    def test_a_deps_dir_console_script_is_resolvable(self, tmp_path: Any) -> None:
+        """pip --target puts console scripts in <target>/bin (Scripts on
+        Windows); the resolver must find them there now that the gateway never
+        creates the venv layout that used to carry them."""
+        from kiro_crew import platform_compat as _pc
+        from kiro_crew.apps.interpreter import app_deps_dir, venv_provided_command
+
+        scripts = "Scripts" if _pc.IS_WINDOWS else "bin"
+        name = "my-tool.exe" if _pc.IS_WINDOWS else "my-tool"
+        script = app_deps_dir(tmp_path) / scripts / name
+        _write_runnable(script)
+        assert venv_provided_command(tmp_path, "my-tool") == str(script)
+
+    def test_a_venv_console_script_still_wins_over_the_deps_dir(self, tmp_path: Any) -> None:
+        from kiro_crew import platform_compat as _pc
+        from kiro_crew.apps.interpreter import app_deps_dir, venv_provided_command
+
+        scripts = "Scripts" if _pc.IS_WINDOWS else "bin"
+        name = "my-tool.exe" if _pc.IS_WINDOWS else "my-tool"
+        venv_script = tmp_path / ".venv" / scripts / name
+        _write_runnable(venv_script)
+        _write_runnable(app_deps_dir(tmp_path) / scripts / name)
+        assert venv_provided_command(tmp_path, "my-tool") == str(venv_script)
 
 
 # ---------------------------------------------------------------------------
@@ -1032,8 +1303,11 @@ class TestAsgiDispatch:
     ) -> None:
         # Real venv layout per platform: POSIX ships bin/python3, native Windows
         # ships Scripts\python.exe (and no python3). The shared resolver honours
-        # both and requires the file to be runnable, so a permission-stripped
-        # interpreter cannot become a guaranteed-EACCES spawn target.
+        # both, requires the file to be runnable (a permission-stripped
+        # interpreter cannot become a guaranteed-EACCES spawn target), and
+        # requires pyvenv.cfg to name the gateway's own Python minor version
+        # (provisioned deps arrive via PYTHONPATH built by sys.executable, so a
+        # mismatched venv would mix ABIs).
         from kiro_crew import platform_compat as _pc
 
         if _pc.IS_WINDOWS:
@@ -1043,6 +1317,9 @@ class TestAsgiDispatch:
         venv_py.parent.mkdir(parents=True)
         venv_py.write_text("#!/bin/sh\n")
         venv_py.chmod(0o755)
+        (spawn_root / ".venv" / "pyvenv.cfg").write_text(
+            f"version = {sys.version_info[0]}.{sys.version_info[1]}.0\n"
+        )
         (spawn_root / "app.py").write_text(self._ASGI_SRC)
         seen = _capture_popen(monkeypatch)
         with pytest.raises(_StopSpawn):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -17,10 +18,17 @@ from kiro_crew.monitoring.models import (
     MonitorOutcome,
     MonitorState,
     ProviderErrorKind,
+    monitor_frontend_contract,
     monitor_state_from_dict,
     monitor_state_public_dict,
     monitor_state_to_dict,
 )
+
+
+def test_frontend_monitor_contract_matches_backend_vocabulary() -> None:
+    path = Path(__file__).parents[1] / "website/src/monitoring/contract.json"
+
+    assert json.loads(path.read_text(encoding="utf-8")) == monitor_frontend_contract()
 
 
 def test_legacy_loop_round_trip_does_not_acquire_monitor_state(tmp_path) -> None:

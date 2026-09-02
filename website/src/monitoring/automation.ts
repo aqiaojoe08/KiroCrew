@@ -1,11 +1,6 @@
-export const STRUCTURED_MONITOR_LIMITS = {
-  cadenceSecs: { minimum: 15, maximum: 86_400, defaultValue: 300 },
-  maxRuntimeSecs: { minimum: 1, maximum: 604_800, defaultValue: 14_400 },
-  maxAgentTurns: { minimum: 1, maximum: 8, defaultValue: 8 },
-  maxTokens: { minimum: 1, maximum: 1_000_000, defaultValue: 250_000 },
-  maxProviderErrors: { minimum: 1, maximum: 20, defaultValue: 3 },
-  wakeInstructions: { maximumLength: 1_000 },
-} as const
+import monitorContract from './contract.json'
+
+export const STRUCTURED_MONITOR_LIMITS = monitorContract.limits
 
 export const STRUCTURED_MONITOR_DEFAULTS = {
   cadenceSecs: STRUCTURED_MONITOR_LIMITS.cadenceSecs.defaultValue,
@@ -46,6 +41,8 @@ export interface LegacyGoalLoop {
   cycleCount: number
   active: boolean
   lastFireAt: number
+  nextDueAt?: number
+  maxRuntimeSecs?: number
   stoppedReason: string
 }
 
@@ -151,6 +148,10 @@ function isTimestamp(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
+function isEnum(value: unknown, values: readonly string[]): value is string {
+  return typeof value === 'string' && values.includes(value)
+}
+
 function isNullableEnum(value: unknown, values: readonly string[]): boolean {
   return value === null || (typeof value === 'string' && values.includes(value))
 }
@@ -159,14 +160,19 @@ function owns(value: JsonObject, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key)
 }
 
-function structuredFallback(loop: JsonObject, monitor: JsonObject | null): StructuredMonitor {
+function structuredFallback(
+  loop: JsonObject,
+  monitor: JsonObject | null,
+  slotKey: string,
+): StructuredMonitor {
   const budgets = object(monitor?.budgets)
   const outcome = text(monitor?.outcome)
+  const active = loop.active === true && !outcome
   return {
     kind: 'structured_monitor',
     id: text(loop.id),
-    slotKey: dashboardAutomationSlotKey(text(loop.slot_key)),
-    active: false,
+    slotKey,
+    active,
     actionable: false,
     version: positive(monitor?.version, 1),
     monitorKind: text(monitor?.kind, 'unknown'),
@@ -197,18 +203,14 @@ function structuredFallback(loop: JsonObject, monitor: JsonObject | null): Struc
       tokenUsageKnown: monitor?.token_usage_known === true,
     },
     action: {
-      wakeInFlight: false,
-      wakeDelivery: '',
+      wakeInFlight: monitor?.wake_in_flight === true,
+      wakeDelivery: text(monitor?.wake_delivery),
     },
     terminal: outcome ? {
       outcome,
       reason: text(monitor?.stopped_reason, text(loop.stopped_reason)),
       stoppedAt: finite(monitor?.stopped_at),
-    } : {
-      outcome: 'blocked',
-      reason: 'invalid_monitor_record',
-      stoppedAt: finite(monitor?.stopped_at),
-    },
+    } : null,
   }
 }
 
@@ -238,6 +240,8 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
       cycleCount: count(loop.cycle_count),
       active: !removed && loop.active === true,
       lastFireAt: finite(loop.last_fire_ts),
+      nextDueAt: finite(loop.next_due_ts),
+      maxRuntimeSecs: count(loop.max_runtime_secs),
       stoppedReason: text(loop.stopped_reason),
     }
   }
@@ -281,26 +285,28 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     monitor?.last_observation_reason_code,
     monitor?.stopped_reason,
   ].every(value => typeof value === 'string')
-  const enumsValid = isNullableEnum(monitor?.wake_delivery, [
-    'dispatched', 'busy', 'unavailable',
-  ]) && isNullableEnum(monitor?.last_completion_disposition, [
-    'success', 'failure', 'cancellation', 'approval_stall',
-  ]) && isNullableEnum(monitor?.last_decision, [
-    'no_change', 'record_only', 'wake_actionable', 'stop_success', 'stop_blocked',
-    'retry_provider', 'stop_budget',
-  ]) && isNullableEnum(monitor?.last_provider_error, [
-    'transient', 'rate_limited', 'authentication', 'authorization', 'not_found', 'setup',
-  ]) && isNullableEnum(monitor?.last_observation_status, [
-    'pending', 'actionable', 'success', 'blocked', 'provider_error',
-  ]) && isNullableEnum(monitor?.outcome, [
-    'success', 'blocked', 'budget', 'user_stop', 'session_close', 'target_unavailable',
-  ])
+  const enumsValid = isNullableEnum(
+    monitor?.wake_delivery,
+    monitorContract.enums.wakeDelivery,
+  ) && isNullableEnum(
+    monitor?.last_completion_disposition,
+    monitorContract.enums.lastCompletionDisposition,
+  ) && isNullableEnum(
+    monitor?.last_decision,
+    monitorContract.enums.lastDecision,
+  ) && isNullableEnum(
+    monitor?.last_provider_error,
+    monitorContract.enums.lastProviderError,
+  ) && isNullableEnum(
+    monitor?.last_observation_status,
+    monitorContract.enums.lastObservationStatus,
+  ) && isNullableEnum(monitor?.outcome, monitorContract.enums.outcome)
   const outcome = typeof monitor?.outcome === 'string' ? monitor.outcome : null
   const active = !removed && loop.active === true
   const lifecycleValid = typeof loop.active === 'boolean' && active !== (outcome !== null)
   const supported = !!monitor
-    && monitor.version === 1
-    && text(monitor.kind) === 'github_pull_request'
+    && monitor.version === monitorContract.monitorStateVersion
+    && isEnum(monitor.kind, monitorContract.pullRequestMonitorKinds)
     && text(monitor.objective) === 'review_ready'
     && !!text(monitor.target)
     && !!budgets
@@ -316,7 +322,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     && monitor.wake_instructions.length
       <= STRUCTURED_MONITOR_LIMITS.wakeInstructions.maximumLength
     && lifecycleValid
-  if (!supported) return structuredFallback(loop, monitor)
+  if (!supported) return structuredFallback(loop, monitor, slotKey)
 
   return {
     kind: 'structured_monitor',
@@ -329,7 +335,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     objective: text(monitor.objective),
     target: text(monitor.target),
     cadenceSecs: positive(monitor.cadence_secs, STRUCTURED_MONITOR_DEFAULTS.cadenceSecs),
-    nextProbeAt: finite(monitor.next_probe_at, finite(loop.next_due_ts)),
+    nextProbeAt: finite(monitor.next_probe_at) || finite(loop.next_due_ts),
     wakeInstructions: text(monitor.wake_instructions),
     budgets: {
       maxRuntimeSecs: positive(budgets.max_runtime_secs, STRUCTURED_MONITOR_DEFAULTS.maxRuntimeSecs),
@@ -377,7 +383,8 @@ export function deriveAutomationStatus(record: AutomationRecord): MonitorStatus 
   if (record.action.wakeInFlight && record.action.wakeDelivery === 'dispatched') {
     return 'action_running'
   }
-  if (record.latest.decision === 'retry_provider' || record.action.wakeDelivery === 'busy') {
+  if (record.latest.decision === 'retry_provider'
+    || (record.action.wakeInFlight && record.action.wakeDelivery === 'busy')) {
     return 'backing_off'
   }
   return record.usage.probes === 0 ? 'arm_pending' : 'active'

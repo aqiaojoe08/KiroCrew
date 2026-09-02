@@ -47,6 +47,7 @@ MONITOR_STOP_UNSUPPORTED_VERSION = "unsupported_monitor_version"
 MONITOR_STOP_USER = "user_stop"
 MONITOR_STOP_SESSION_UNAVAILABLE = "session_unavailable"
 MONITOR_STOP_SESSION_CLOSE = "session_close"
+PULL_REQUEST_MONITOR_KINDS = frozenset({"github_pull_request"})
 _GITHUB_OBSERVATION_FIELDS = (
     "blocking_review",
     "checks",
@@ -181,6 +182,51 @@ class MonitorDispatchResult(str, Enum):
     DISPATCHED = "dispatched"
     BUSY = "busy"
     UNAVAILABLE = "unavailable"
+
+
+def monitor_frontend_contract() -> dict[str, object]:
+    """Return the checked data contract consumed by the dashboard bundle."""
+    return {
+        "schemaVersion": 1,
+        "monitorStateVersion": MONITOR_STATE_VERSION,
+        "limits": {
+            "cadenceSecs": {
+                "minimum": MIN_MONITOR_CADENCE_SECS,
+                "maximum": MAX_MONITOR_CADENCE_SECS,
+                "defaultValue": DEFAULT_MONITOR_CADENCE_SECS,
+            },
+            "maxRuntimeSecs": {
+                "minimum": 1,
+                "maximum": MAX_MONITOR_RUNTIME_SECS,
+                "defaultValue": DEFAULT_MONITOR_RUNTIME_SECS,
+            },
+            "maxAgentTurns": {
+                "minimum": 1,
+                "maximum": MAX_MONITOR_AGENT_TURNS,
+                "defaultValue": DEFAULT_MONITOR_AGENT_TURNS,
+            },
+            "maxTokens": {
+                "minimum": 1,
+                "maximum": MAX_MONITOR_TOKENS,
+                "defaultValue": DEFAULT_MONITOR_TOKENS,
+            },
+            "maxProviderErrors": {
+                "minimum": 1,
+                "maximum": MAX_MONITOR_PROVIDER_ERRORS,
+                "defaultValue": DEFAULT_MONITOR_PROVIDER_ERRORS,
+            },
+            "wakeInstructions": {"maximumLength": MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS},
+        },
+        "pullRequestMonitorKinds": sorted(PULL_REQUEST_MONITOR_KINDS),
+        "enums": {
+            "wakeDelivery": [item.value for item in MonitorDispatchResult],
+            "lastCompletionDisposition": [item.value for item in MonitorActionDisposition],
+            "lastDecision": [item.value for item in MonitorDecision],
+            "lastProviderError": [item.value for item in ProviderErrorKind],
+            "lastObservationStatus": [item.value for item in MonitorObservationStatus],
+            "outcome": [item.value for item in MonitorOutcome],
+        },
+    }
 
 
 @dataclass(frozen=True)

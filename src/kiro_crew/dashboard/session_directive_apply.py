@@ -163,7 +163,7 @@ async def apply_session_directive(
         elif kind == "monitor_update":
             result = await _monitor_update(session_key, args)
         elif kind == "monitor_stop":
-            result = await _monitor_stop(session_key)
+            result = await _monitor_stop(session_key, args)
         elif kind == "autonudge_stop":
             result = await _autonudge_stop(slot, session_key, args)
         elif kind == "set_project":
@@ -235,6 +235,7 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         max_runtime_secs=max_runtime_secs,
         source="mcp-directive",
         caller="session-directive",
+        replace_existing=False,
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record
@@ -259,9 +260,7 @@ async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> 
 
     svc = get_instance()
     if svc is None:
-        raise _DirectiveDenied(
-            "Structured monitor NOT armed: auto-nudge is disabled on this host."
-        )
+        raise _DirectiveDenied("Structured monitor NOT armed: auto-nudge is disabled on this host.")
     binding = _structured_binding(session_key)
     if not binding:
         raise _DirectiveDenied("monitor_watch is not supported from this session type.")
@@ -290,6 +289,7 @@ async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> 
         max_runtime_secs=monitor.budgets.max_runtime_secs,
         source="mcp-directive",
         caller="session-directive",
+        replace_existing=False,
         monitor=monitor,
     )
     if error is not None:
@@ -317,6 +317,8 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
         raise _DirectiveDenied("No active monitor loop on this session to update.")
     patch = dict(args.get("patch") or {})
     if getattr(loop, "monitor", None) is not None:
+        if _structured_binding(session_key) != binding:
+            raise _DirectiveDenied("monitor_update is not supported from this session type.")
         return await _structured_monitor_update(svc, loop, patch)
     structured_only = sorted(
         set(patch)
@@ -428,9 +430,8 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
         # The authorizer already audited its own refusal; agree with it.
         raise _DirectiveDenied(f"Failed to update monitor loop: {error}")
     fields = ", ".join(sorted(k for k in patch if k != "active"))
-    return (
-        f"Monitor loop {loop.id} updated on this session ({fields})."
-        + (" The stopped loop has been re-armed." if revived else "")
+    return f"Monitor loop {loop.id} updated on this session ({fields})." + (
+        " The stopped loop has been re-armed." if revived else ""
     )
 
 
@@ -511,15 +512,23 @@ async def _structured_monitor_update(svc: Any, loop: Any, patch: dict[str, Any])
     return f"Structured monitor {updated.id} updated on this session."
 
 
-async def _monitor_stop(session_key: str) -> str:
+def _structured_stop_reason(args: dict[str, Any]) -> str:
+    from kiro_crew.monitoring.models import MAX_MONITOR_STOP_REASON_CHARS
+    from kiro_crew.security import redact_and_truncate
+
+    return redact_and_truncate(
+        str(args.get("reason") or "").strip(),
+        max_chars=MAX_MONITOR_STOP_REASON_CHARS,
+    )
+
+
+async def _monitor_stop(session_key: str, args: dict[str, Any]) -> str:
     from kiro_crew.autonudge import get_instance
     from kiro_crew.autonudge_authz import authorize_and_stop_monitor
 
     svc = get_instance()
     if svc is None:
-        raise _DirectiveDenied(
-            "Monitor was not stopped: auto-nudge is disabled on this host."
-        )
+        raise _DirectiveDenied("Monitor was not stopped: auto-nudge is disabled on this host.")
     binding = _structured_binding(session_key)
     if not binding:
         raise _DirectiveDenied("monitor_stop is not supported from this session type.")
@@ -532,13 +541,12 @@ async def _monitor_stop(session_key: str) -> str:
         session_key=loop.slot_key,
         source="mcp-directive",
         caller="session-directive",
+        user_reason=_structured_stop_reason(args),
     )
     if error is not None:
         raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
     if stopped is None:
-        raise _DirectiveDenied(
-            "Failed to stop structured monitor: no monitor record was returned."
-        )
+        raise _DirectiveDenied("Failed to stop structured monitor: no monitor record was returned.")
     return f"Structured monitor {stopped.id} stopped and retained for inspection."
 
 
@@ -560,7 +568,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
     if not loop:
         return _no_loop_message(svc, binding)
     loop_id = loop.id
-    reason = str(args.get("reason") or "").strip()
+    reason = _structured_stop_reason(args)
     # Research Lab consumes a persisted stop record to distinguish deliberate
     # completion from unreachable-session cleanup. The canonical name is not
     # ownership evidence: users may give an ordinary dashboard slot the same
@@ -576,9 +584,10 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
             session_key=loop.slot_key,
             source="mcp-directive",
             caller="autonudge-stop-compat",
+            user_reason=_structured_stop_reason(args),
         )
         if error is not None:
-            return f"Failed to stop structured monitor: {error}"
+            raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
     elif is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:

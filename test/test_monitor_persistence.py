@@ -17,6 +17,7 @@ from kiro_crew.monitoring.models import (
     MonitorState,
     ProviderErrorKind,
     monitor_state_from_dict,
+    monitor_state_public_dict,
     monitor_state_to_dict,
 )
 
@@ -231,10 +232,27 @@ async def test_failed_legacy_loop_update_restores_live_state(tmp_path, monkeypat
     assert loop.next_due_ts == 1_500.0
 
 
-def test_unknown_monitor_version_is_inspectable_and_inert_without_losing_active_intent(
+def test_monitor_public_projection_includes_lifecycle_timestamps_and_wake_reason() -> None:
+    state = MonitorState(
+        kind="github_pull_request",
+        target="owner/repo#123",
+        objective="review_ready",
+        created_ts=1_000.0,
+        last_wake_reason_code="checks_failed",
+        user_stop_reason="Superseded by a newer review.",
+    )
+
+    public = monitor_state_public_dict(state)
+
+    assert public["created_ts"] == 1_000.0
+    assert public["last_wake_reason_code"] == "checks_failed"
+    assert public["user_stop_reason"] == "Superseded by a newer review."
+
+
+def test_unknown_monitor_version_is_inspectable_inert_and_persisted_inactive(
     tmp_path,
 ) -> None:
-    """A downgrade must not durably disable work a newer gateway can resume."""
+    """A downgrade preserves opaque state without presenting unsupported work as active."""
     future_monitor = {
         "version": 99,
         "kind": "github_pull_request",
@@ -272,14 +290,14 @@ def test_unknown_monitor_version_is_inspectable_and_inert_without_losing_active_
     service._load()
 
     restored = service._loops["future01"]
-    assert restored.active
+    assert not restored.active
     assert restored.monitor is not None
     assert restored.monitor.version == 99
     assert restored.monitor.target == "owner/repo#123"
     assert restored.monitor.outcome is MonitorOutcome.BLOCKED
     assert restored.monitor.stopped_reason == "unsupported_monitor_version"
     serialized_loop = service._serialize_state()["loops"][0]
-    assert serialized_loop["active"] is True
+    assert serialized_loop["active"] is False
     serialized_monitor = serialized_loop["monitor"]
     assert serialized_monitor == future_monitor
 
@@ -309,8 +327,8 @@ async def test_unknown_monitor_version_is_never_armed(tmp_path) -> None:
     arm_timer.assert_not_called()
 
 
-def test_future_monitor_without_current_identity_survives_store_rewrite(tmp_path) -> None:
-    """A future schema may rename every v1 identity field without being erased."""
+def test_future_monitor_without_current_identity_is_inert_and_survives_rewrite(tmp_path) -> None:
+    """A future schema stays opaque but cannot appear active to this gateway."""
     future_monitor = {
         "version": 99,
         "identity_v2": {"resource": "opaque", "intent": "future"},
@@ -336,18 +354,18 @@ def test_future_monitor_without_current_identity_survives_store_rewrite(tmp_path
     service._load()
 
     restored = service._loops["future02"]
-    assert restored.active
+    assert not restored.active
     assert restored.monitor is not None
     assert restored.monitor.version == 99
     assert restored.monitor.outcome is MonitorOutcome.BLOCKED
     service._save()
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["loops"][0]["active"] is True
+    assert persisted["loops"][0]["active"] is False
     assert persisted["loops"][0]["monitor"] == future_monitor
 
 
 @pytest.mark.asyncio
-async def test_generic_save_preserves_future_monitor_active_intent(tmp_path) -> None:
+async def test_generic_update_cannot_reactivate_future_monitor(tmp_path) -> None:
     future_monitor = {
         "version": 99,
         "identity_v2": {"resource": "opaque", "intent": "future"},
@@ -369,14 +387,16 @@ async def test_generic_save_preserves_future_monitor_active_intent(tmp_path) -> 
     path.write_text(json.dumps(store), encoding="utf-8")
     service = AutoNudgeService(base_dir=tmp_path)
     service._load()
+    await service.start()
 
     updated = await service.update("future03", active=True)
 
     assert updated is not None
-    assert updated.active is True
+    assert updated.active is False
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["loops"][0]["active"] is True
+    assert persisted["loops"][0]["active"] is False
     assert persisted["loops"][0]["monitor"] == future_monitor
+    service.stop()
 
 
 def test_malformed_monitor_cannot_rearm_after_restart(tmp_path) -> None:
@@ -412,11 +432,20 @@ def test_malformed_monitor_cannot_rearm_after_restart(tmp_path) -> None:
     assert restored.monitor is not None
     assert restored.monitor.outcome is MonitorOutcome.BLOCKED
     assert restored.monitor.stopped_reason == "invalid_monitor_record"
-    assert service._serialize_state()["loops"][0]["monitor"] == malformed_monitor
+    serialized_monitor = service._serialize_state()["loops"][0]["monitor"]
+    assert serialized_monitor["outcome"] == "blocked"
+    assert serialized_monitor["stopped_reason"] == "invalid_monitor_record"
+    assert serialized_monitor["agent_turns"] == 0
 
     service._save()
     persisted = json.loads((tmp_path / "autonudge.json").read_text(encoding="utf-8"))
-    assert persisted["loops"][0]["monitor"] == malformed_monitor
+    persisted_monitor = persisted["loops"][0]["monitor"]
+    assert persisted_monitor["outcome"] == "blocked"
+    assert persisted_monitor["stopped_reason"] == "invalid_monitor_record"
+
+    reloaded = AutoNudgeService(base_dir=tmp_path)
+    reloaded._load()
+    assert not reloaded._store_dirty
 
 
 def test_oversized_monitor_timestamp_is_quarantined_without_data_loss(tmp_path) -> None:
@@ -453,7 +482,9 @@ def test_oversized_monitor_timestamp_is_quarantined_without_data_loss(tmp_path) 
     assert restored.monitor.created_ts == 0.0
     assert restored.monitor.outcome is MonitorOutcome.BLOCKED
     assert restored.monitor.stopped_reason == "invalid_monitor_record"
-    assert service._serialize_state()["loops"][0]["monitor"] == malformed_monitor
+    serialized_monitor = service._serialize_state()["loops"][0]["monitor"]
+    assert serialized_monitor["outcome"] == "blocked"
+    assert serialized_monitor["stopped_reason"] == "invalid_monitor_record"
 
 
 def test_malformed_current_outcome_cannot_rearm_after_restart(tmp_path) -> None:

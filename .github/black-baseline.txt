@@ -235,7 +235,6 @@ src/kiro_crew/dashboard/handlers_cloud.py
 src/kiro_crew/dashboard/loop_watchdog.py
 src/kiro_crew/dashboard/port_reclaim.py
 src/kiro_crew/dashboard/routes/skills.py
-src/kiro_crew/dashboard/session_directive_apply.py
 src/kiro_crew/dashboard/session_health.py
 src/kiro_crew/dashboard/session_memory.py
 src/kiro_crew/dashboard/slowloris.py
@@ -327,7 +326,6 @@ src/kiro_crew/mcp_gateway/verdict_cache.py
 src/kiro_crew/mcp_shared.py
 src/kiro_crew/mcp_tools/apps.py
 src/kiro_crew/mcp_tools/artifacts.py
-src/kiro_crew/mcp_tools/control.py
 src/kiro_crew/mcp_tools/knowledge.py
 src/kiro_crew/mcp_tools/skills.py
 src/kiro_crew/mcp_tools/spawn.py
@@ -347,7 +345,6 @@ src/kiro_crew/pod/config.py
 src/kiro_crew/pod/launchd.py
 src/kiro_crew/pod/provision.py
 src/kiro_crew/pod/unit.py
-src/kiro_crew/providers/acp.py
 src/kiro_crew/publish_governance.py
 src/kiro_crew/publish_sync.py
 src/kiro_crew/resource_status.py

@@ -212,9 +212,7 @@ def schemas() -> list[dict[str, Any]]:
                 "properties": {
                     "questions": {
                         "type": "array",
-                        "description": (
-                            "1-4 questions to show in one card, each with 1-6 options"
-                        ),
+                        "description": ("1-4 questions to show in one card, each with 1-6 options"),
                         "items": {
                             "type": "object",
                             "properties": {
@@ -731,19 +729,21 @@ def wait(name: str, args: dict[str, Any]) -> str:
             try:
                 reply = mcp_core._post(
                     "/api/session-keepalive",
-                    {
-                        "wait_id": wait_id,
-                        "seconds": seconds,
-                        "remaining": max(0, int(remaining)),
-                        # Lets the dashboard derive a liveness window for
-                        # this sleep without importing this module's
-                        # constant -- see _service_wait_ping's collision
-                        # guard, which needs to know how stale a ping has to
-                        # be before the sleep behind it is presumed gone.
-                        "interval": _ping_secs,
-                    }
-                    if _identified
-                    else {},
+                    (
+                        {
+                            "wait_id": wait_id,
+                            "seconds": seconds,
+                            "remaining": max(0, int(remaining)),
+                            # Lets the dashboard derive a liveness window for
+                            # this sleep without importing this module's
+                            # constant -- see _service_wait_ping's collision
+                            # guard, which needs to know how stale a ping has to
+                            # be before the sleep behind it is presumed gone.
+                            "interval": _ping_secs,
+                        }
+                        if _identified
+                        else {}
+                    ),
                 )
             except Exception:
                 reply = {}  # keepalive is best-effort
@@ -753,11 +753,7 @@ def wait(name: str, args: dict[str, Any]) -> str:
             # `_identified` too: an unidentified sleep sends no wait_id, so a
             # matching reply could only mean the backend is answering about
             # somebody else's wait.
-            if (
-                _identified
-                and isinstance(reply, dict)
-                and reply.get("end_wait") == wait_id
-            ):
+            if _identified and isinstance(reply, dict) and reply.get("end_wait") == wait_id:
                 ended_early = True
                 break
             _next_ping = now + _ping_secs
@@ -1018,16 +1014,8 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             "Monitor loop requested on this session: the message will "
             f"re-inject every {interval_secs}s (user messages defer a due "
             "fire to their turn's end without restarting the countdown)"
-            + (
-                f", stopping after {max_cycles} cycles"
-                if max_cycles
-                else ", with NO cycle cap"
-            )
-            + (
-                f", wall-clock budget {max_runtime_secs}s"
-                if max_runtime_secs
-                else ""
-            )
+            + (f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap")
+            + (f", wall-clock budget {max_runtime_secs}s" if max_runtime_secs else "")
             + ". End your turn now; once the loop is armed it wakes you on "
             "that interval — but arming happens when this turn's result is "
             "processed, and only a live dashboard/Slack/Discord session can "
@@ -1113,9 +1101,7 @@ def monitor_inspect(name: str, args: dict[str, Any]) -> str:
 
 def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
     """Project the browser record into a bounded, agent-oriented status."""
-    compact = {
-        key: result.get(key) for key in ("enabled", "active", "monitor_id") if key in result
-    }
+    compact = {key: result.get(key) for key in ("enabled", "active", "monitor_id") if key in result}
     raw = result.get("monitor")
     if not isinstance(raw, dict):
         compact["monitor"] = None
@@ -1137,11 +1123,14 @@ def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
         "provider_error_count",
         "consecutive_provider_errors",
         "last_probe_at",
+        "created_ts",
         "last_decision",
+        "last_wake_reason_code",
         "last_provider_error",
         "next_probe_at",
         "outcome",
         "stopped_reason",
+        "user_stop_reason",
         "stopped_at",
     )
     monitor = {key: raw.get(key) for key in fields}

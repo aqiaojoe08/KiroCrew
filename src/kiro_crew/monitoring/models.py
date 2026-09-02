@@ -30,6 +30,7 @@ MAX_MONITOR_AGENT_TURNS = 8
 MAX_MONITOR_TOKENS = 1_000_000
 MAX_MONITOR_PROVIDER_ERRORS = 20
 MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS = 1_000
+MAX_MONITOR_STOP_REASON_CHARS = 500
 MAX_MONITOR_CHECK_NAMES = 8
 # The normal turn ceiling is two hours. One extra minute lets the raw completion
 # callback win the timeout race while keeping missing evidence restart-durable
@@ -39,6 +40,7 @@ MONITOR_BUSY_RETRY_SECS = 15
 MONITOR_STOP_RUNTIME_BUDGET = "runtime_budget"
 MONITOR_STOP_AGENT_TURN_BUDGET = "agent_turn_budget"
 MONITOR_STOP_TOKEN_BUDGET = "token_budget"
+MONITOR_STOP_PROVIDER_ERROR_BUDGET = "provider_error_budget"
 MONITOR_STOP_APPROVAL_STALL = "approval_stall"
 MONITOR_STOP_COMPLETION_UNAVAILABLE = "completion_evidence_unavailable"
 MONITOR_STOP_UNSUPPORTED_VERSION = "unsupported_monitor_version"
@@ -51,6 +53,7 @@ MONITOR_PUBLIC_FIELDS = (
     "kind",
     "target",
     "objective",
+    "created_ts",
     "budgets",
     "cadence_secs",
     "wake_instructions",
@@ -58,6 +61,7 @@ MONITOR_PUBLIC_FIELDS = (
     "last_fingerprint",
     "last_observed_at",
     "last_wake_fingerprint",
+    "last_wake_reason_code",
     "wake_in_flight",
     "wake_delivery",
     "wake_count",
@@ -78,6 +82,7 @@ MONITOR_PUBLIC_FIELDS = (
     "next_probe_at",
     "outcome",
     "stopped_reason",
+    "user_stop_reason",
     "stopped_at",
 )
 
@@ -290,6 +295,7 @@ class MonitorState:
     next_probe_at: float = 0.0
     outcome: MonitorOutcome | None = None
     stopped_reason: str = ""
+    user_stop_reason: str = ""
     stopped_at: float = 0.0
     extra_fields: dict[str, object] = field(default_factory=dict, repr=False)
     _raw_payload: dict[str, object] | None = field(default=None, repr=False, compare=False)
@@ -376,6 +382,10 @@ class MonitorState:
             raise ValueError("outcome must be a MonitorOutcome")
         if not isinstance(self.stopped_reason, str):
             raise ValueError("stopped_reason must be a string")
+        if not isinstance(self.user_stop_reason, str):
+            raise ValueError("user_stop_reason must be a string")
+        if len(self.user_stop_reason) > MAX_MONITOR_STOP_REASON_CHARS:
+            raise ValueError("user_stop_reason is too long")
         if not isinstance(self.extra_fields, dict):
             raise ValueError("extra_fields must be an object")
         _validate_strict_json_object("extra_fields", self.extra_fields)
@@ -451,7 +461,7 @@ def monitor_state_from_dict(raw: object) -> MonitorState:
 
 
 def quarantine_monitor_state(raw: object) -> MonitorState:
-    """Build an inert inspection view while preserving strict raw JSON exactly."""
+    """Build a valid inert replacement for a malformed current-version record."""
     if not isinstance(raw, dict):
         raise ValueError("monitor state must be an object")
 
@@ -471,7 +481,6 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         created_ts=created_ts,
         outcome=MonitorOutcome.BLOCKED,
         stopped_reason=MONITOR_STOP_INVALID_RECORD,
-        _raw_payload=deepcopy(raw),
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
@@ -104,20 +105,28 @@ class MonitorController:
         dispatch: MonitorDispatcher,
         *,
         provider: _Provider | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._service = service
         self._dispatch = dispatch
+        self._clock = clock
         self._provider = provider or GitHubPullRequestProvider()
 
     async def tick(self, loop: _Loop, *, now: float) -> MonitorDecision:
         state = getattr(loop, "monitor", None)
         if state is None:
             raise ValueError("structured monitor state is required")
-        # A terminal record may briefly retain an in-flight correlation while
-        # its already-started action turn reaches raw completion. It is still
-        # inert: no probe, BUSY redispatch, or evidence-expiry transition may
-        # replace the retained outcome.
         if state.outcome is not None:
+            if (
+                state.wake_in_flight
+                and state.completion_evidence_deadline > 0
+                and now >= state.completion_evidence_deadline
+            ):
+                await self._service.record_monitor_completion_evidence_unavailable(
+                    loop.id,
+                    state.last_wake_fingerprint,
+                    now=now,
+                )
             return MonitorDecision.STOP_BLOCKED
         if state.wake_in_flight:
             deadline = state.completion_evidence_deadline
@@ -198,9 +207,19 @@ class MonitorController:
             return MonitorDecision.STOP_BLOCKED
         try:
             delivered = await self._dispatch(loop, envelope)
+        except asyncio.CancelledError:
+            await self._service.record_monitor_dispatch_busy(
+                loop.id,
+                state.last_wake_fingerprint,
+                now=now,
+            )
+            raise
         except Exception:
             logger.exception("structured monitor delivery raised unexpectedly")
             delivered = MonitorDispatchResult.BUSY
+        if not isinstance(delivered, MonitorDispatchResult):
+            logger.error("structured monitor dispatcher returned an untyped result")
+            delivered = MonitorDispatchResult.UNAVAILABLE
         if delivered is MonitorDispatchResult.UNAVAILABLE:
             await self._service.record_monitor_dispatch_failure(
                 loop.id,
@@ -217,10 +236,8 @@ class MonitorController:
             await self._service.record_monitor_dispatched(
                 loop.id,
                 state.last_wake_fingerprint,
-                now=now,
+                now=self._clock(),
             )
-        else:
-            raise TypeError("monitor dispatcher returned an untyped result")
         return MonitorDecision.WAKE_ACTIONABLE
 
 

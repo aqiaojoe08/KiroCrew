@@ -138,8 +138,11 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                 "active": True,
                 "monitor": {
                     "kind": "github_pull_request",
+                    "created_ts": 123.0,
                     "wake_count": 3,
                     "wake_instructions": "large prompt omitted from inspect",
+                    "last_wake_reason_code": "checks_failed",
+                    "user_stop_reason": "operator stopped",
                     "last_observation": {
                         "head_revision": "abc123",
                         "checks": {"passed": [f"check-{index}" for index in range(20)]},
@@ -153,7 +156,10 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     get.assert_called_once_with("/api/autonudge/session-monitor", session_key="slack:123")
     payload = json.loads(result)
     assert payload["monitor"]["kind"] == "github_pull_request"
+    assert payload["monitor"]["created_ts"] == 123.0
     assert payload["monitor"]["wake_count"] == 3
+    assert payload["monitor"]["last_wake_reason_code"] == "checks_failed"
+    assert payload["monitor"]["user_stop_reason"] == "operator stopped"
     assert payload["monitor"]["observation"]["checks"]["passed_count"] == 20
     assert "wake_instructions" not in payload["monitor"]
     assert "check-0" not in result

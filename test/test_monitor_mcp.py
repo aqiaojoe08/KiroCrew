@@ -87,6 +87,7 @@ def test_monitor_watch_rejects_kind_target_mismatch_before_emitting_directive():
             },
         )
 
+
 def test_monitor_watch_rejects_native_subagent_binding():
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="subagent:child"):
         result = control.monitor_watch(

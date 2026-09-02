@@ -102,7 +102,9 @@ the same two-value enum gates the dashboard config editor in
 `dashboard/handlers/core.py`). `"off"` skips Kiro Crew's own sandbox. It does not
 permit internal-sandbox delegation for a relocated or linked coordinator ledger;
 that combination fails closed. Setting `"auto"` re-enables Kiro Crew's own
-sandbox.
+sandbox. The macOS conflict remedy requires that `"auto"` posture before it
+directs the operator to disable Kiro CLI's internal sandbox, so following the
+remedy cannot leave the next spawn without either isolation owner.
 
 `wrap_argv`'s internal tier vocabulary is wider than the config enum: `standard`
 (what `auto` resolves to), `cc`, `strict` and `off`. Those extra tiers are reached
@@ -140,7 +142,13 @@ Two properties are load-bearing at the architecture level:
   directory keeps the ledger at its configured path. When that path traverses a
   link, the gateway records the canonical coordinator directory outside the link
   and gives the same owner-only anchor to SQLite and every sandbox builder. The
-  anchor directory is agent-denied and hidden inside Kiro Crew's OS sandboxes, so
+  Linux launcher creates and owner-tightens the anchor before constructing its
+  existence-guarded bind masks. The macOS Seatbelt profile denies both lexical
+  and canonical ledger and anchor spellings so a symlinked home cannot expose an
+  alias. Existing anchor records are checked before the ordinary-directory fast
+  path and must match the currently resolved ledger, so replacing a selected link
+  with a directory or pre-seeding its deterministic record fails closed. The
+  directory is agent-denied and hidden inside Kiro Crew's OS sandboxes, so
   retargeting the link cannot make a later process trust a forged ledger or make a
   child mask a different directory. Internal-sandbox delegation refuses this
   exceptional linked shape rather than dropping the control.

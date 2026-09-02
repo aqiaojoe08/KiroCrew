@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import kiro_crew.config.paths as paths_mod
 import kiro_crew.run_coordinator.sqlite as sqlite_mod
 import kiro_crew.run_coordinator_anchor as anchor_mod
 from kiro_crew.run_coordinator import (
@@ -131,11 +133,11 @@ async def test_default_sqlite_path_cannot_be_retargeted_after_first_use(
 
 
 @pytest.mark.asyncio
-async def test_default_sqlite_path_survives_retarget_across_gateway_restart(
+async def test_default_sqlite_path_rejects_retarget_across_gateway_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A durable anchor must outlive the process-local path cache."""
+    """A durable anchor must fail closed when its selected link moves."""
     real_home = tmp_path / "real-home"
     real_home.mkdir()
     replacement_home = tmp_path / "replacement-home"
@@ -144,7 +146,9 @@ async def test_default_sqlite_path_survives_retarget_across_gateway_restart(
     linked_home.symlink_to(real_home, target_is_directory=True)
     anchor_home = tmp_path / "operator-home"
     anchor_home.mkdir()
-    monkeypatch.setattr(anchor_mod, "data_home", lambda: linked_home)
+    monkeypatch.setenv("KIROCREW_HOME", str(linked_home))
+    monkeypatch.setattr(paths_mod, "_config_dir_memo", None)
+    monkeypatch.setattr(paths_mod, "_resolved_home", None)
     monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
     anchor_mod._clear_run_coordinator_anchor_cache()
 
@@ -153,15 +157,93 @@ async def test_default_sqlite_path_survives_retarget_across_gateway_restart(
 
     linked_home.unlink()
     linked_home.symlink_to(replacement_home, target_is_directory=True)
+    paths_mod._config_dir_memo = None
     anchor_mod._clear_run_coordinator_anchor_cache()
 
-    assert anchor_mod.canonical_run_coordinator_dir() == first
+    with pytest.raises(OSError, match="does not match the configured data home"):
+        anchor_mod.canonical_run_coordinator_dir()
+    assert anchor_mod.run_coordinator_anchor_matches_current_home() is False
     coordinator = SQLiteRunCoordinator()
-    created = await coordinator.submit(_request())
+    with pytest.raises(OSError, match="does not match the configured data home"):
+        await coordinator.submit(_request())
 
-    assert created.value is not None
-    assert (first / "coordinator.db").exists()
+    assert not (first / "coordinator.db").exists()
     assert not (replacement_home / "run-coordinator" / "coordinator.db").exists()
+
+
+def test_unconfined_anchor_check_ignores_memoized_data_home_after_retarget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live symlink retarget must outrank the config path memo."""
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    replacement_home = tmp_path / "replacement-home"
+    replacement_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.setenv("KIROCREW_HOME", str(linked_home))
+    monkeypatch.setattr(paths_mod, "_config_dir_memo", None)
+    monkeypatch.setattr(paths_mod, "_resolved_home", None)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    assert paths_mod.data_home() == real_home
+    assert anchor_mod.canonical_run_coordinator_dir() == real_home / "run-coordinator"
+
+    linked_home.unlink()
+    linked_home.symlink_to(replacement_home, target_is_directory=True)
+
+    assert anchor_mod.run_coordinator_anchor_matches_current_home() is False
+
+
+def test_unconfined_anchor_check_uses_default_home_for_rejected_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected override must retain the configured default-home fallback."""
+    default_home = tmp_path / "default-home"
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.setenv("KIROCREW_HOME", os.path.abspath(os.sep))
+    monkeypatch.setattr(paths_mod, "_default_home", lambda: default_home)
+    monkeypatch.setattr(paths_mod, "_config_dir_memo", None)
+    monkeypatch.setattr(paths_mod, "_resolved_home", None)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    assert anchor_mod.canonical_run_coordinator_dir() == default_home / "run-coordinator"
+    assert anchor_mod.run_coordinator_anchor_matches_current_home() is True
+
+
+def test_existing_anchor_rejects_linked_home_replaced_by_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.setenv("KIROCREW_HOME", str(linked_home))
+    monkeypatch.setattr(paths_mod, "_config_dir_memo", None)
+    monkeypatch.setattr(paths_mod, "_resolved_home", None)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    first = anchor_mod.canonical_run_coordinator_dir()
+    assert first == real_home / "run-coordinator"
+
+    linked_home.unlink()
+    linked_home.mkdir()
+    paths_mod._config_dir_memo = None
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    with pytest.raises(OSError, match="does not match the configured data home"):
+        anchor_mod.canonical_run_coordinator_dir()
 
 
 def test_default_real_home_needs_no_external_anchor(
@@ -180,6 +262,30 @@ def test_default_real_home_needs_no_external_anchor(
 
     assert anchor_mod.canonical_run_coordinator_dir() == data_home / "run-coordinator"
     assert not anchor_mod.run_coordinator_anchor_dir().exists()
+
+
+def test_prepare_anchor_directory_creates_and_tightens_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = tmp_path / ".kirocrew.run-coordinator"
+    calls: list[tuple[str, Path]] = []
+
+    monkeypatch.setattr(anchor_mod, "run_coordinator_anchor_dir", lambda: anchor)
+
+    def make(path: Path) -> None:
+        calls.append(("make", path))
+        path.mkdir()
+
+    monkeypatch.setattr(anchor_mod, "make_owner_only_dir", make)
+    monkeypatch.setattr(
+        anchor_mod,
+        "restrict_dir_to_owner",
+        lambda path: calls.append(("restrict", path)),
+    )
+
+    assert anchor_mod.prepare_run_coordinator_anchor_dir() == anchor
+    assert calls == [("make", anchor), ("restrict", anchor)]
 
 
 async def _claimed_running(

@@ -47,7 +47,10 @@ from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.platform import current_context
 from kiro_crew.run_coordinator_anchor import (
     canonical_run_coordinator_dir,
+    configured_run_coordinator_dir,
+    prepare_run_coordinator_anchor_dir,
     run_coordinator_anchor_dir,
+    run_coordinator_anchor_matches_current_home,
 )
 
 try:
@@ -1006,6 +1009,18 @@ def _run_coordinator_hidden_dir() -> str:
     """Return the active ledger path that every OS sandbox must hide."""
 
     return os.path.abspath(canonical_run_coordinator_dir())
+
+
+def _run_coordinator_hidden_paths() -> tuple[str, ...]:
+    """Return every lexical and canonical spelling Seatbelt must deny."""
+    return tuple(
+        dict.fromkeys(
+            (
+                os.path.abspath(configured_run_coordinator_dir()),
+                _run_coordinator_hidden_dir(),
+            )
+        )
+    )
 
 
 def _prepare_run_coordinator_hidden_dir() -> str:
@@ -2384,7 +2399,7 @@ def _build_launcher_script(
     hidden_dirs.extend(_relocated_policy_cache_dirs())
     hidden_dirs.extend(_relocated_crew_targets(_CREW_HIDDEN_LEAVES))
     hidden_dirs.extend(_voice_runtime_sandbox_paths())
-    hidden_dirs.append(os.path.abspath(run_coordinator_anchor_dir()))
+    hidden_dirs.append(os.path.abspath(prepare_run_coordinator_anchor_dir()))
     hidden_dirs.extend(os.path.abspath(path) for path in extra_hidden_dirs)
     unhidden = [
         path for path in hidden_dirs if _hidden_path_contains_visible_path(path, extra_visible_dirs)
@@ -3384,24 +3399,28 @@ def _build_seatbelt_profile(
     # Unlike the home-relative compatibility entries, the active ledger path
     # follows a valid KIROCREW_HOME override. It is never eligible for a caller
     # visibility carve-out and is denied for reads, writes, and hardlinks.
-    coordinator_path = _run_coordinator_hidden_dir()
-    coordinator_dir = coordinator_path.replace('"', '\\"')
-    rules.append(f'(deny file-read* (subpath "{coordinator_dir}"))')
-    rules.append(f'(deny file-write* (subpath "{coordinator_dir}"))')
-    rules.append(f'(deny file-link (subpath "{coordinator_dir}"))')
+    coordinator_paths = _run_coordinator_hidden_paths()
+    for coordinator_path in coordinator_paths:
+        coordinator_dir = coordinator_path.replace('"', '\\"')
+        rules.append(f'(deny file-read* (subpath "{coordinator_dir}"))')
+        rules.append(f'(deny file-write* (subpath "{coordinator_dir}"))')
+        rules.append(f'(deny file-link (subpath "{coordinator_dir}"))')
     # Seatbelt subpath rules follow the original path spelling. Prevent an agent
     # from renaming the ledger or one of its ancestors and then reaching the
     # relocated directory outside those rules. Literal denies protect the rename
     # targets without denying ordinary writes elsewhere in their subtrees.
-    for target in _literal_ancestor_guards((coordinator_path,)):
+    for target in _literal_ancestor_guards(coordinator_paths):
         escaped = target.replace('"', '\\"')
         rules.append(f'(deny file-write* (literal "{escaped}"))')
     anchor_path = os.path.abspath(run_coordinator_anchor_dir())
-    anchor_dir = anchor_path.replace('"', '\\"')
-    rules.append(f'(deny file-read* (subpath "{anchor_dir}"))')
-    rules.append(f'(deny file-write* (subpath "{anchor_dir}"))')
-    rules.append(f'(deny file-link (subpath "{anchor_dir}"))')
-    rules.append(f'(deny file-write* (literal "{anchor_dir}"))')
+    # A macOS home may itself be a symlink. Seatbelt matches the spelling used
+    # for access, so protect both the stable anchor's lexical and canonical paths.
+    for target in dict.fromkeys((anchor_path, os.path.realpath(anchor_path))):
+        anchor_dir = target.replace('"', '\\"')
+        rules.append(f'(deny file-read* (subpath "{anchor_dir}"))')
+        rules.append(f'(deny file-write* (subpath "{anchor_dir}"))')
+        rules.append(f'(deny file-link (subpath "{anchor_dir}"))')
+        rules.append(f'(deny file-write* (literal "{anchor_dir}"))')
 
     # .ssh: deny all access except reading known_hosts (strict only)
     if sandbox_level == "strict":
@@ -4800,7 +4819,7 @@ class SandboxUnavailableError(RuntimeError):
         self.remedy = remedy
 
 
-def _refuse_kiro_sandbox_policy_conflict(argv: list[str], detail: str) -> NoReturn:
+def _refuse_kiro_sandbox_policy_conflict(argv: list[str], detail: str, mode: str) -> NoReturn:
     """Refuse a Kiro spawn whose required path policy cannot be delegated.
 
     A path deny that only Kiro Crew understands has no safe execution shape
@@ -4830,17 +4849,52 @@ def _refuse_kiro_sandbox_policy_conflict(argv: list[str], detail: str) -> NoRetu
             "coordinator state."
         )
     else:
+        remedy = (
+            'Set agent.sandbox to "auto" before disabling Kiro CLI\'s sandbox; '
+            if mode == "off"
+            else ""
+        )
         message = (
             "Kiro CLI's internal macOS sandbox cannot enforce Kiro Crew's "
             "required run-coordinator path policy for this relocated or linked "
             "KIROCREW_HOME ledger, and macOS Seatbelt layers cannot be "
             "nested. Refusing to start the agent rather than expose durable "
-            'coordinator state. Set {"sandbox": false} in '
+            f"coordinator state. {remedy}"
+            'Set {"sandbox": false} in '
             "~/.kiro/settings/amazon-internal.json so Kiro Crew's sandbox owns "
             "isolation, then restart the gateway."
         )
     raise SandboxUnavailableError(
         message,
+        kind="foreign_sandbox",
+        detail=detail,
+    )
+
+
+def _refuse_retargeted_run_coordinator_unconfined(argv: list[str]) -> NoReturn:
+    """Refuse an unconfined spawn that could read a stale canonical ledger."""
+    detail = (
+        "the persisted run-coordinator ledger differs from the ledger under "
+        "the currently resolved KIROCREW_HOME"
+    )
+    try:
+        from kiro_crew.sel import sel  # circular import: sandbox is low-level
+
+        sel().log_tool_invocation(
+            session_key="sandbox",
+            agent="system",
+            source="sandbox.wrap_argv",
+            tool_name=argv[0] if argv else "unknown",
+            tool_kind="subprocess",
+            outcome="denied",
+            error=detail,
+        )
+    except Exception:
+        logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
+    raise SandboxUnavailableError(
+        "KIROCREW_HOME was retargeted after the durable run-coordinator ledger "
+        "was anchored. Refusing unconfined execution because hook-layer path "
+        "protection now covers the new target, not the persisted ledger.",
         kind="foreign_sandbox",
         detail=detail,
     )
@@ -5034,6 +5088,7 @@ def wrap_argv(
                 argv,
                 "the active run-coordinator ledger is outside the default data home: "
                 + _run_coordinator_hidden_dir(),
+                mode,
             )
 
     if mode == "off":
@@ -5044,6 +5099,8 @@ def wrap_argv(
         # on macOS kiro-cli spawns; on Linux (where kiro's internal sandbox
         # doesn't apply) or non-kiro spawns, "off" means genuinely unconfined.
         kiro_spawn_off = kiro_spawn
+        if not nested_kirocrew_sandbox and not run_coordinator_anchor_matches_current_home():
+            _refuse_retargeted_run_coordinator_unconfined(argv)
         if darwin_kiro_internal_sandbox:
             # Delegation is valid: kiro-cli's sandbox IS active. Apply env scrub
             # (same as _delegate_to_kiro_internal_sandbox) but WITHOUT the
@@ -5260,6 +5317,7 @@ def wrap_argv(
                     argv,
                     "caller-specific sandbox paths cannot be delegated to "
                     "Kiro CLI's internal sandbox",
+                    mode,
                 )
         else:
             delegated = _delegate_to_kiro_internal_sandbox(
@@ -5310,6 +5368,8 @@ def wrap_argv(
         )
 
     if backend == "none":
+        if not run_coordinator_anchor_matches_current_home():
+            _refuse_retargeted_run_coordinator_unconfined(argv)
         # Reaching here while the kernel says this process IS sandboxed means the
         # outer sandbox is NOT one KiroCrew built: a KiroCrew-built one carries
         # KIROCREW_SANDBOX_ACTIVE and was already passed through above. The

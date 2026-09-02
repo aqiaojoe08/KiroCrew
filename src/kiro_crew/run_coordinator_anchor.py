@@ -8,7 +8,12 @@ import stat
 import threading
 from pathlib import Path
 
-from kiro_crew.config.paths import RUN_COORDINATOR_DIR_NAME, data_home
+from kiro_crew.config.paths import (
+    RUN_COORDINATOR_DIR_NAME,
+    _resolve_default_home,
+    _valid_override_home,
+    data_home,
+)
 from kiro_crew.platform_compat import (
     is_link_or_junction,
     make_owner_only_dir,
@@ -39,6 +44,35 @@ def _anchor_key() -> tuple[str, str]:
 def run_coordinator_anchor_dir() -> Path:
     """Return the agent-denied directory holding canonical ledger anchors."""
     return _anchor_home() / RUN_COORDINATOR_ANCHOR_DIR_NAME
+
+
+def prepare_run_coordinator_anchor_dir() -> Path:
+    """Create and fail-loud owner-tighten the agent-denied anchor directory."""
+    anchor_dir = run_coordinator_anchor_dir()
+    if is_link_or_junction(anchor_dir):
+        raise OSError("run coordinator anchor directory cannot be a link")
+    make_owner_only_dir(anchor_dir)
+    if is_link_or_junction(anchor_dir):
+        raise OSError("run coordinator anchor directory cannot be a link")
+    restrict_dir_to_owner(anchor_dir)
+    return anchor_dir
+
+
+def _configured_data_home() -> Path:
+    """Return the selected data home without erasing a valid override's spelling."""
+    raw_override = os.environ.get("KIROCREW_HOME")
+    if not raw_override:
+        return data_home()
+    if _valid_override_home() is None:
+        # Resolve the configured fallback directly. A memoized override may
+        # still name its prior target after the live link becomes unsafe.
+        return _resolve_default_home()
+    return Path(os.path.abspath(Path(raw_override).expanduser()))
+
+
+def configured_run_coordinator_dir() -> Path:
+    """Return the selected ledger path without resolving a valid home's alias."""
+    return _configured_data_home() / RUN_COORDINATOR_DIR_NAME
 
 
 def _read_anchor(path: Path) -> Path:
@@ -101,21 +135,39 @@ def canonical_run_coordinator_dir() -> Path:
         if cached is not None:
             return cached
 
-        configured = data_home() / RUN_COORDINATOR_DIR_NAME
+        configured = configured_run_coordinator_dir()
         lexical = os.path.normcase(os.path.abspath(configured))
         resolved = configured.resolve(strict=False)
+
+        # A lexical home that used to be a link can later be replaced by an
+        # ordinary directory. Its spelling still selects the same persisted
+        # identity, so consult an existing record before the direct-path fast
+        # path or a restart would silently abandon the original ledger.
+        anchor_dir = run_coordinator_anchor_dir()
+        record = anchor_dir / key[1]
+        try:
+            os.lstat(anchor_dir)
+        except FileNotFoundError:
+            pass
+        else:
+            prepare_run_coordinator_anchor_dir()
+            try:
+                anchored = _read_anchor(record)
+            except FileNotFoundError:
+                pass
+            else:
+                if os.path.normcase(os.path.abspath(anchored)) != os.path.normcase(
+                    os.path.abspath(resolved)
+                ):
+                    raise OSError("run coordinator anchor does not match the configured data home")
+                _anchor_cache[key] = anchored
+                return anchored
+
         if os.path.normcase(os.path.abspath(resolved)) == lexical:
             _anchor_cache[key] = configured
             return configured
 
-        anchor_dir = run_coordinator_anchor_dir()
-        if is_link_or_junction(anchor_dir):
-            raise OSError("run coordinator anchor directory cannot be a link")
-        make_owner_only_dir(anchor_dir)
-        if is_link_or_junction(anchor_dir):
-            raise OSError("run coordinator anchor directory cannot be a link")
-        restrict_dir_to_owner(anchor_dir)
-
+        anchor_dir = prepare_run_coordinator_anchor_dir()
         record = anchor_dir / key[1]
         try:
             anchored = _read_anchor(record)
@@ -127,8 +179,31 @@ def canonical_run_coordinator_dir() -> Path:
                 _create_anchor(record, anchored)
             except FileExistsError:
                 anchored = _read_anchor(record)
+                if os.path.normcase(os.path.abspath(anchored)) != os.path.normcase(
+                    os.path.abspath(resolved)
+                ):
+                    raise OSError("run coordinator anchor does not match the configured data home")
         _anchor_cache[key] = anchored
         return anchored
+
+
+def run_coordinator_anchor_matches_current_home() -> bool:
+    """Return whether the canonical ledger is under the currently resolved home.
+
+    A persisted anchor deliberately survives retargeting the configured data-home
+    link. The old target is no longer covered by hook-layer path matching after
+    such a retarget, so callers may use this proof before allowing execution
+    without an OS sandbox.
+    """
+    configured = _configured_data_home() / RUN_COORDINATOR_DIR_NAME
+    try:
+        anchored = canonical_run_coordinator_dir()
+        resolved = configured.resolve(strict=False)
+    except OSError:
+        return False
+    return os.path.normcase(os.path.abspath(anchored)) == os.path.normcase(
+        os.path.abspath(resolved)
+    )
 
 
 def _clear_run_coordinator_anchor_cache() -> None:
